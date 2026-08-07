@@ -19,9 +19,36 @@ use vmm::seccomp::get_empty_filters;
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
 use vmm::{EventManager, FcExitCode};
 
-static VMLINUX: &[u8] = include_bytes!(env!("JOOS_VMLINUX_PATH"));
-static INITRD: &[u8] = include_bytes!(env!("JOOS_INITRD_PATH"));
-static CONFIG_JSON: &str = include_str!(env!("JOOS_CONFIG_PATH"));
+// Must match the MAX constants in build.rs.
+const VMLINUX_MAX: usize = 24 * 1024 * 1024;
+const INITRD_MAX: usize = 12 * 1024 * 1024;
+const CONFIG_MAX: usize = 64 * 1024;
+
+// Each slot lives in its own dedicated ELF section (rather than sharing
+// .rodata with everything else) so `objcopy --update-section` can overwrite
+// just that section's bytes directly in the already-built binary when only
+// the asset changes - no cargo/rustc/mold at all. See build.rs and
+// tools/patch_fire2.sh. Slot format: 8-byte LE length prefix + real bytes +
+// zero padding out to the MAX capacity above (falls back to a real rebuild
+// if an asset ever exceeds its capacity - build.rs panics in that case).
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".joos_vmlinux")]
+static VMLINUX_SLOT: [u8; 8 + VMLINUX_MAX] = *include_bytes!(env!("JOOS_VMLINUX_SLOT_PATH"));
+
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".joos_initrd")]
+static INITRD_SLOT: [u8; 8 + INITRD_MAX] = *include_bytes!(env!("JOOS_INITRD_SLOT_PATH"));
+
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".joos_config")]
+static CONFIG_SLOT: [u8; 8 + CONFIG_MAX] = *include_bytes!(env!("JOOS_CONFIG_SLOT_PATH"));
+
+/// Extracts the real (unpadded) bytes out of a slot: an 8-byte LE length
+/// prefix followed by that many real bytes, then zero padding.
+fn slot_data(slot: &'static [u8]) -> &'static [u8] {
+    let len = u64::from_le_bytes(slot[0..8].try_into().unwrap()) as usize;
+    &slot[8..8 + len]
+}
 
 fn main() {
     // Matches the wrapper's unlink() of stale sockets from a previous run -
@@ -52,15 +79,17 @@ fn main() {
 
     let mut event_manager = EventManager::new().expect("failed to create EventManager");
 
-    let mut vm_resources = VmResources::from_json(CONFIG_JSON, &instance_info, 0, None)
+    let config_json =
+        std::str::from_utf8(slot_data(&CONFIG_SLOT)).expect("embedded config JSON is not UTF-8");
+    let mut vm_resources = VmResources::from_json(config_json, &instance_info, 0, None)
         .expect("failed to parse embedded config JSON");
     // Matches --boot-timer on the stock firecracker launch this replaces.
     vm_resources.boot_timer = true;
     // The whole point: load straight from the embedded bytes above, instead
     // of boot_source.builder's File (which the embedded config's patched
     // boot-source section deliberately points at /dev/null - see build.rs).
-    vm_resources.kernel_bytes = Some(VMLINUX);
-    vm_resources.initrd_bytes = Some(INITRD);
+    vm_resources.kernel_bytes = Some(slot_data(&VMLINUX_SLOT));
+    vm_resources.initrd_bytes = Some(slot_data(&INITRD_SLOT));
 
     // Matches --no-seccomp on the stock firecracker launch this replaces.
     let seccomp_filters = get_empty_filters();
