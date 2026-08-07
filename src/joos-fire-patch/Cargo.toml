@@ -4,7 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-object = { version = "0.36", default-features = false, features = ["read_core", "elf", "std"] }
+# No dependencies: hand-rolled, seek-based ELF section-header lookup (see
+# section_file_range() in main.rs) - deliberately avoids reading section
+# content into this process at all, which the previous `object`-crate-based
+# version (reading the whole file into memory first) turned out to do, and
+# that reliably corrupted the patched fire2 binary at runtime despite
+# producing byte-correct output on disk. See main.rs's top comment.
 
 # Deliberately built via plain `cargo build` (no --release) - Cargo profiles
 # can only be set in the workspace root manifest, and per-package overrides

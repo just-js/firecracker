@@ -48,9 +48,10 @@ fn resolve(env_var: &str, default_rel: &str) -> PathBuf {
 }
 
 /// Resolves a slot capacity from an env var (e.g. `JOOS_VMLINUX_MAX=33554432
-/// cargo build ...`), falling back to `default`, and re-exports the
-/// resolved value via `cargo:rustc-env` so main.rs's `env!()` always sees
-/// the exact same number build.rs used to pad the slot file with.
+/// cargo build ...`), falling back to `default`. Doesn't export it via
+/// `cargo:rustc-env` itself - see `resolve_padded_size` below, used for the
+/// two slots (`VMLINUX_SLOT`/`INITRD_SLOT`) that need the extra alignment
+/// step; `CONFIG_MAX` is a plain compile-time constant with no such need.
 fn resolve_size(env_var: &str, default: usize) -> usize {
     let value = std::env::var(env_var)
         .ok()
@@ -60,9 +61,39 @@ fn resolve_size(env_var: &str, default: usize) -> usize {
                 .unwrap_or_else(|e| panic!("{env_var}={v:?}: not a valid size in bytes: {e}"))
         })
         .unwrap_or(default);
-    println!("cargo:rustc-env={env_var}={value}");
     println!("cargo:rerun-if-env-changed={env_var}");
     value
+}
+
+/// `resolve_size`, then pads the result so `8 + capacity` (the slot's total
+/// size) is already a 4096-byte multiple, and exports *that* padded value
+/// via `cargo:rustc-env` (main.rs's `env!()` picks up this padded number
+/// directly for `PageAligned<N>`'s `N`, not the raw requested size).
+///
+/// Why: `VMLINUX_SLOT`/`INITRD_SLOT` are `PageAligned<N>` (`repr(align(4096))`)
+/// in main.rs - `repr(align)` rounds a type's *size* up to the alignment,
+/// so `size_of::<PageAligned<N>>()` is `N` rounded up to 4096, which is
+/// *larger* than `N` whenever `N` isn't already a 4096 multiple (normally
+/// the case). That's the section's actual, final size (what the linker
+/// allocates) - `joos-fire-patch`, hot-patching later, only ever sees that
+/// ELF section (no Rust-level knowledge of `N`), so it necessarily treats
+/// the *padded* size as the slot's capacity. Padding `N` itself here, so
+/// `size_of::<PageAligned<N>>() == N` with no hidden extra rounding, keeps
+/// a single, unambiguous "capacity" everywhere - build.rs, `joos-fire-patch`,
+/// and the runtime reader (`slot_full_bytes()` in main.rs) all agree
+/// without needing to separately replicate the same rounding logic in each
+/// place. Getting this wrong is exactly a bug that shipped here once
+/// already: with `N` left unpadded, a full rebuild (self-consistent, since
+/// build.rs and main.rs's `env!()` agreed on the same unpadded `N`) and a
+/// hot-patch (which necessarily used the section's already-padded size)
+/// wrote the length trailer at two *different* offsets - confirmed via a
+/// core dump: the runtime read landed on zero-padding instead of the real
+/// trailer, reading a length of 0 and failing to parse an "empty" vmlinux.
+fn resolve_padded_size(env_var: &str, default: usize) -> usize {
+    let value = resolve_size(env_var, default);
+    let padded = (8 + value).next_multiple_of(4096) - 8;
+    println!("cargo:rustc-env={env_var}={padded}");
+    padded
 }
 
 /// Writes `dest` as `content` + zero padding to `capacity` bytes + an 8-byte
@@ -96,8 +127,8 @@ fn main() {
     let initrd = resolve("JOOS_INITRD", "initrd.cpio");
     let config_src = resolve("JOOS_CONFIG", "fire_mem.json");
 
-    let vmlinux_max = resolve_size("JOOS_VMLINUX_MAX", DEFAULT_VMLINUX_MAX);
-    let initrd_max = resolve_size("JOOS_INITRD_MAX", DEFAULT_INITRD_MAX);
+    let vmlinux_max = resolve_padded_size("JOOS_VMLINUX_MAX", DEFAULT_VMLINUX_MAX);
+    let initrd_max = resolve_padded_size("JOOS_INITRD_MAX", DEFAULT_INITRD_MAX);
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
 

@@ -77,8 +77,6 @@ pub enum MemoryError {
     SeekError(std::io::Error),
     /// Volatile memory error: {0}
     VolatileMemoryError(vm_memory::VolatileMemoryError),
-    /// Cannot clone backing file for a joos-fire zero-copy region: {0}
-    FileClone(std::io::Error),
 }
 
 impl From<vm_memory::VolatileMemoryError> for MemoryError {
@@ -550,46 +548,58 @@ pub fn create(
         .collect::<Result<Vec<_>, _>>()
 }
 
-/// Creates a `Vec<GuestRegionMmap>` mixing arbitrary file-backed and
-/// anonymous regions in one pass - see joos/INIT.md's "Plan: zero-copy
-/// vmlinux/initrd loading in VMM construction". Each entry in `regions` is
-/// `(guest_start, size, file_offset)`: `Some(off)` maps that region
-/// `MAP_PRIVATE` from `file` at absolute offset `off` (every file-backed
-/// region here shares the same `file` - in practice all windows into this
-/// same running executable's embedded vmlinux/initrd slots); `None` maps it
-/// anonymous, same as `anonymous()` above. Unlike `create()`, file offsets
-/// are explicit per-region rather than auto-accumulated from 0, since a
-/// vmlinux's `PT_LOAD` segments are not contiguous in the source file.
+/// Creates a `Vec<GuestRegionMmap>` mixing regions that directly wrap an
+/// already-existing host mapping with plain anonymous regions in one pass -
+/// see joos/INIT.md's "Plan: zero-copy vmlinux/initrd loading in VMM
+/// construction". Each entry in `regions` is `(guest_start, size,
+/// host_addr)`: `Some(addr)` wraps the memory *already mapped* at that host
+/// address directly via `MmapRegionBuilder::with_raw_mmap_pointer()` - no
+/// new `mmap()` call - `owned: false` internally, so dropping the resulting
+/// region never `munmap()`s memory this function didn't create (per
+/// `MmapRegion::build_raw`'s own docs: intended for a mapping "provided by
+/// an entity outside the control of the caller", e.g. the dynamic linker -
+/// exactly `joos-fire`'s own `VMLINUX_SLOT`/`INITRD_SLOT` statics here).
+/// `None` maps anonymous, same as `anonymous()` above.
 ///
-/// File-backed regions are pre-populated here (read every page once from
-/// host userspace, right after `madvise(MADV_HUGEPAGE)`) before returning,
-/// so KVM never has to service an EPT violation for these pages during
-/// actual guest execution - see the microbenchmark results in INIT.md
-/// (`tools/mmap_bench.c`) for why this ordering (`madvise` *then* touch,
-/// not `MAP_POPULATE`) was chosen: it was the fastest of the variants
-/// tried, and applying `MADV_HUGEPAGE` after population was consistently
-/// worse than before it.
+/// `addr` must point at memory the ELF loader already mapped `MAP_PRIVATE`
+/// + `PROT_READ|PROT_WRITE` (a writable `PT_LOAD` segment) - this only
+/// *describes* the existing mapping's permissions to `vm-memory`, it can't
+/// change them, so a read-only source here would silently produce a region
+/// the guest can't actually write into.
+///
+/// Directly-wrapped regions are pre-populated here (read every page once
+/// from host userspace, right after `madvise(MADV_HUGEPAGE)`) before
+/// returning, so KVM never has to service an EPT violation for these pages
+/// during actual guest execution - see the microbenchmark results in
+/// INIT.md (`tools/mmap_bench.c`). Note the `MADV_HUGEPAGE` hint is
+/// probably less effective here than it was in that benchmark: the
+/// existing mapping predates this call by definition (it's been part of
+/// the process since `exec()`), so its pages may already be resident as
+/// regular 4K pages, and synchronous huge-page promotion needs the hint
+/// set *before* first touch - kept anyway since it's cheap and harmless
+/// either way.
 pub fn mixed(
-    regions: &[(GuestAddress, usize, Option<u64>)],
-    file: &File,
+    regions: &[(GuestAddress, usize, Option<usize>)],
     track_dirty_pages: bool,
 ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
     let page_size = host_page_size();
     regions
         .iter()
-        .map(|&(start, size, file_offset)| {
+        .map(|&(start, size, host_addr)| {
             let mut builder = MmapRegionBuilder::new_with_bitmap(
                 size,
                 track_dirty_pages.then(|| AtomicBitmap::with_len(size)),
             )
             .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE);
 
-            builder = match file_offset {
-                Some(off) => {
-                    let cloned = file.try_clone().map_err(MemoryError::FileClone)?;
-                    builder
-                        .with_mmap_flags(libc::MAP_NORESERVE | libc::MAP_PRIVATE)
-                        .with_file_offset(FileOffset::new(cloned, off))
+            builder = match host_addr {
+                Some(addr) => {
+                    // SAFETY: caller guarantees `addr`/`size` describe a
+                    // region within a valid, already MAP_PRIVATE+writable
+                    // mapping present in this process (see doc comment
+                    // above).
+                    let raw = unsafe { builder.with_raw_mmap_pointer(addr as *mut u8) };
+                    raw.with_mmap_flags(libc::MAP_PRIVATE)
                 }
                 None => builder.with_mmap_flags(
                     libc::MAP_NORESERVE | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
@@ -602,7 +612,7 @@ pub fn mixed(
             unsafe {
                 libc::madvise(ptr as *mut c_void, size, libc::MADV_HUGEPAGE);
             }
-            if file_offset.is_some() {
+            if host_addr.is_some() {
                 // Pre-populate: touch one byte per page from host userspace
                 // now, so every page is already resident (and its EPT
                 // mapping trivially installable) by the time the guest

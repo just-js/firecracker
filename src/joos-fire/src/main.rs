@@ -67,19 +67,75 @@ const CONFIG_MAX: usize = 64 * 1024;
 #[repr(C, align(4096))]
 struct PageAligned<const N: usize>([u8; N]);
 
+// `static mut`, not `static`: Rust derives an ELF section's *flags* (in
+// particular, writable or not) from the static's mutability, not from
+// `#[link_section]`'s name - a plain immutable `static` here lands in a
+// read-only segment regardless of the custom section name (confirmed via
+// readelf: `.joos_vmlinux`/`.joos_initrd` were segment-flagged `R` only).
+// That's a real correctness problem, not just a naming nuance: the
+// zero-copy plan (joos/INIT.md) wants to expose this memory directly as
+// guest RAM via `MmapRegion::build_raw()` (wrapping the ELF loader's own
+// existing mapping, no extra mmap() call needed), but the guest genuinely
+// writes into both regions - vmlinux's own `RW`/`RWE` PT_LOAD segments
+// during boot, and initrd's memory once the kernel frees it after
+// unpacking and reuses that GPA range as ordinary RAM. A read-only host
+// mapping there would fault the guest the first time either happens.
+// `static mut` (accessed only via `&raw const`/`&raw mut`, never through an
+// actual `&mut` reference, so no aliasing UB - see vmlinux_slot()/
+// initrd_slot() below) makes the ELF loader map this MAP_PRIVATE + writable
+// (COW) instead, same semantics a fresh mmap would give, just reusing the
+// mapping that's already there.
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".joos_vmlinux")]
-static VMLINUX_SLOT: PageAligned<{ 8 + VMLINUX_MAX }> =
+static mut VMLINUX_SLOT: PageAligned<{ 8 + VMLINUX_MAX }> =
     PageAligned(*include_bytes!(env!("JOOS_VMLINUX_SLOT_PATH")));
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".joos_initrd")]
-static INITRD_SLOT: PageAligned<{ 8 + INITRD_MAX }> =
+static mut INITRD_SLOT: PageAligned<{ 8 + INITRD_MAX }> =
     PageAligned(*include_bytes!(env!("JOOS_INITRD_SLOT_PATH")));
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".joos_config")]
 static CONFIG_SLOT: [u8; 8 + CONFIG_MAX] = *include_bytes!(env!("JOOS_CONFIG_SLOT_PATH"));
+
+/// Returns the *full padded* byte range a `PageAligned<N>` occupies -
+/// `size_of::<PageAligned<N>>()` bytes, which `repr(align(4096))` can (and
+/// normally does) make *larger* than `N`, rounding up to the next 4096
+/// multiple. Deliberately not just `&self.0` (the inner `[u8; N]` array,
+/// `N` bytes): the ELF section this type lives in is sized to match the
+/// struct's full padded footprint (that's what the linker actually
+/// allocates), not `N` - and `joos-fire-patch` only ever sees that ELF
+/// section, with no Rust-level knowledge of `N`, so it necessarily
+/// computes the slot's capacity (and therefore where it writes the length
+/// trailer - see `write_slot()` in build.rs) from the *section's* size.
+/// Reading based on `N` instead of the section's padded size disagrees
+/// with that by exactly the padding gap - confirmed via a core dump: a
+/// hot-patched binary had byte-correct content, but the runtime trailer
+/// read landed 4088 bytes short of where `joos-fire-patch` had actually
+/// written it, on now-zeroed padding, reading a length of 0 and failing to
+/// parse an "empty" vmlinux. Using the same padded size everywhere (this
+/// function) makes a full rebuild and a hot patch agree unconditionally.
+///
+/// # Safety
+/// `ptr` must point at a valid, live `PageAligned<N>`.
+unsafe fn slot_full_bytes<const N: usize>(ptr: *const PageAligned<N>) -> &'static [u8] {
+    // SAFETY: caller guarantees `ptr` is valid; the returned slice's
+    // length exactly matches the type's own size, so it never reads past
+    // the object's extent.
+    unsafe { std::slice::from_raw_parts(ptr as *const u8, size_of::<PageAligned<N>>()) }
+}
+
+/// Safe accessors for the two `static mut` slots above - a single `unsafe`
+/// block each, using `&raw const` (never an actual `&`/`&mut` reference to
+/// the static itself) so there's no aliasing hazard even though the
+/// underlying storage is technically mutable.
+fn vmlinux_slot() -> &'static [u8] {
+    unsafe { slot_full_bytes(&raw const VMLINUX_SLOT) }
+}
+fn initrd_slot() -> &'static [u8] {
+    unsafe { slot_full_bytes(&raw const INITRD_SLOT) }
+}
 
 /// Extracts the real (unpadded) bytes out of a slot: real content, zero
 /// padding, then an 8-byte LE length trailer at the very end (see
@@ -100,90 +156,6 @@ fn free_hugepages_2m() -> Option<usize> {
         .trim()
         .parse()
         .ok()
-}
-
-/// Minimal ELF64 section-header lookup against this process's own running
-/// executable, to find `.joos_vmlinux`/`.joos_initrd`'s *current* file
-/// offset - see `joos/INIT.md`'s "zero-copy" plan. Can't be a build-time
-/// constant: `joos-fire-patch` can overwrite a section's *content*
-/// post-link without moving its *offset*, but the offset itself is only
-/// fixed once linking has happened, so build.rs (which runs before
-/// linking) can never know it. Hand-rolled (no `object` crate) to avoid
-/// adding a dependency to joos-fire's own release build, which already has
-/// a real link-time cost to watch (see build.rs's profile comment in
-/// joos-fire-patch's Cargo.toml for the related reasoning). Reads only the
-/// ELF header + section header table + string table once - not the whole
-/// multi-MB file, and not re-opened/re-read per name (an earlier version
-/// called a single-section lookup twice; every microsecond here is boot
-/// time, so this looks up both names in one pass over one open file
-/// instead). Returns `(sh_offset, sh_size)` per name in `names`, in the
-/// same order, or `None` on any I/O error or if any name isn't found -
-/// callers treat that as "disable zero-copy, fall back to the copy-based
-/// path" (see `try_build_zero_copy_layout` below).
-fn section_file_offsets<const N: usize>(path: &str, names: [&str; N]) -> Option<[(u64, u64); N]> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    fn u16le(b: &[u8], off: usize) -> u16 {
-        u16::from_le_bytes(b[off..off + 2].try_into().unwrap())
-    }
-    fn u32le(b: &[u8], off: usize) -> u32 {
-        u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
-    }
-    fn u64le(b: &[u8], off: usize) -> u64 {
-        u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
-    }
-
-    let mut f = std::fs::File::open(path).ok()?;
-
-    let mut ehdr = [0u8; 64];
-    f.read_exact(&mut ehdr).ok()?;
-    if &ehdr[0..4] != b"\x7fELF" {
-        return None;
-    }
-
-    let e_shoff = u64le(&ehdr, 40);
-    let e_shentsize = u16le(&ehdr, 58) as usize;
-    let e_shnum = u16le(&ehdr, 60) as usize;
-    let e_shstrndx = u16le(&ehdr, 62) as usize;
-    if e_shentsize != 64 {
-        return None;
-    }
-
-    f.seek(SeekFrom::Start(e_shoff)).ok()?;
-    let mut shdrs = vec![0u8; e_shnum * e_shentsize];
-    f.read_exact(&mut shdrs).ok()?;
-
-    let shstr = &shdrs[e_shstrndx * e_shentsize..][..e_shentsize];
-    let shstrtab_off = u64le(shstr, 24);
-    let shstrtab_size = u64le(shstr, 32) as usize;
-    f.seek(SeekFrom::Start(shstrtab_off)).ok()?;
-    let mut shstrtab = vec![0u8; shstrtab_size];
-    f.read_exact(&mut shstrtab).ok()?;
-
-    let mut results = [None; N];
-    for i in 0..e_shnum {
-        let sh = &shdrs[i * e_shentsize..][..e_shentsize];
-        let name_off = u32le(sh, 0) as usize;
-        let end = shstrtab[name_off..]
-            .iter()
-            .position(|&b| b == 0)
-            .map(|p| name_off + p)
-            .unwrap_or(shstrtab.len());
-        let Some(section_name) = shstrtab.get(name_off..end) else {
-            continue;
-        };
-        for (slot, name) in results.iter_mut().zip(names) {
-            if section_name == name.as_bytes() {
-                *slot = Some((u64le(sh, 24), u64le(sh, 32)));
-            }
-        }
-    }
-
-    let mut out = [(0u64, 0u64); N];
-    for (o, r) in out.iter_mut().zip(results) {
-        *o = r?;
-    }
-    Some(out)
 }
 
 /// (file_offset_within_vmlinux, guest_paddr, filesz, memsz) per `PT_LOAD`
@@ -244,7 +216,7 @@ fn find_pvh_entry(note_bytes: &[u8]) -> Option<u64> {
     None
 }
 
-/// Parses `bytes` (the *actually embedded* vmlinux, `slot_data(&VMLINUX_SLOT.0)`
+/// Parses `bytes` (the *actually embedded* vmlinux, `slot_data(vmlinux_slot())`
 /// - never a build-time snapshot, see the module-level comment on why that
 /// was wrong) as an ELF64 file, `None` on any structural problem so the
 /// caller falls back to the copy-based path instead of hard-failing boot.
@@ -315,57 +287,35 @@ fn parse_vmlinux_layout(bytes: &[u8]) -> Option<VmlinuxLayout> {
 /// before this feature existed. See joos/INIT.md's "Plan: zero-copy
 /// vmlinux/initrd loading in VMM construction".
 fn try_build_zero_copy_layout(vm_resources: &VmResources) -> Option<ZeroCopyLayout> {
-    const SELF_EXE: &str = "/proc/self/exe";
-
-    let [(vmlinux_section_off, vmlinux_section_size), (initrd_section_off, initrd_section_size)] =
-        section_file_offsets(SELF_EXE, [".joos_vmlinux", ".joos_initrd"]).or_else(|| {
-            eprintln!(
-                "[joos-fire] zero-copy: .joos_vmlinux/.joos_initrd section lookup in {SELF_EXE} \
-                 failed - falling back"
-            );
-            None
-        })?;
-
-    // >= rather than == : PageAligned<N>'s repr(align(4096)) rounds the
-    // struct's *total* size up to a 4096 multiple, so the section can be
-    // (and normally is) a little larger than the inner array's exact
-    // length - that's just alignment padding at the end, harmless, and
-    // never read (slot_data() only reads the first 8+len bytes anyway).
-    if vmlinux_section_size < VMLINUX_SLOT.0.len() as u64
-        || initrd_section_size < INITRD_SLOT.0.len() as u64
-    {
-        eprintln!(
-            "[joos-fire] zero-copy: section size in {SELF_EXE} is smaller than this process's \
-             own slot sizes - falling back"
-        );
-        return None;
-    }
-
     // Parsed fresh from the actually-embedded bytes every time (not a
     // build-time snapshot - see the module-level comment on VmlinuxLayout
     // for why that was a real bug, caught via a real `make patch-fire2`).
-    let vmlinux_bytes = slot_data(&VMLINUX_SLOT.0);
+    let vmlinux_bytes = slot_data(vmlinux_slot());
     let layout = parse_vmlinux_layout(vmlinux_bytes).or_else(|| {
         eprintln!("[joos-fire] zero-copy: embedded vmlinux doesn't parse as a valid ELF64 image - falling back");
         None
     })?;
 
-    // No offset adjustment needed here: content starts at offset 0 of each
-    // slot (the length trailer lives at the *end* - see write_slot() in
-    // build.rs), and the section itself is page-aligned via PageAligned, so
-    // vmlinux_section_off/initrd_section_off are already the exact absolute
-    // file offsets content starts at.
-    let kernel_segments: Vec<(u64, u64, u64, u64)> = layout
+    // host_addr = the real, in-process address of each segment's bytes -
+    // no file/offset lookup needed at all, since VMLINUX_SLOT's bytes are
+    // already mapped (by the ELF loader, at process start) exactly where
+    // vmlinux_bytes.as_ptr() points right now. builder.rs wraps this
+    // directly via MmapRegion::build_raw() instead of a separate mmap() of
+    // /proc/self/exe - see ZeroCopyLayout's doc comment for why this only
+    // works because VMLINUX_SLOT/INITRD_SLOT are `static mut` (writable).
+    let vmlinux_base = vmlinux_bytes.as_ptr() as usize;
+    let kernel_segments: Vec<(usize, u64, u64, u64)> = layout
         .segments
         .iter()
-        .map(|&(off, paddr, filesz, memsz)| (vmlinux_section_off + off, paddr, filesz, memsz))
+        .map(|&(off, paddr, filesz, memsz)| (vmlinux_base + off as usize, paddr, filesz, memsz))
         .collect();
     let (kernel_entry_addr, kernel_boot_protocol_is_pvh) = match layout.pvh_entry {
         Some(pvh) => (pvh, true),
         None => (layout.e_entry, false),
     };
-    let initrd_file_offset = initrd_section_off;
-    let initrd_size = slot_data(&INITRD_SLOT.0).len() as u64;
+    let initrd_bytes = slot_data(initrd_slot());
+    let initrd_host_addr = initrd_bytes.as_ptr() as usize;
+    let initrd_size = initrd_bytes.len() as u64;
 
     let mem_size_mib = vm_resources.machine_config.mem_size_mib as u64;
     let lowmem_size = mem_size_mib * 1024 * 1024;
@@ -377,11 +327,10 @@ fn try_build_zero_copy_layout(vm_resources: &VmResources) -> Option<ZeroCopyLayo
     let initrd_guest_addr = (lowmem_size - initrd_size) & !(page - 1);
 
     Some(ZeroCopyLayout {
-        backing_path: SELF_EXE,
         kernel_segments: Box::leak(kernel_segments.into_boxed_slice()),
         kernel_entry_addr,
         kernel_boot_protocol_is_pvh,
-        initrd_file_offset,
+        initrd_host_addr,
         initrd_guest_addr,
         initrd_size,
     })
@@ -425,8 +374,8 @@ fn main() {
     // The whole point: load straight from the embedded bytes above, instead
     // of boot_source.builder's File (which the embedded config's patched
     // boot-source section deliberately points at /dev/null - see build.rs).
-    vm_resources.kernel_bytes = Some(slot_data(&VMLINUX_SLOT.0));
-    vm_resources.initrd_bytes = Some(slot_data(&INITRD_SLOT.0));
+    vm_resources.kernel_bytes = Some(slot_data(vmlinux_slot()));
+    vm_resources.initrd_bytes = Some(slot_data(initrd_slot()));
 
     // Zero-copy guest memory construction - see joos/INIT.md's "Plan:
     // zero-copy vmlinux/initrd loading in VMM construction" and its

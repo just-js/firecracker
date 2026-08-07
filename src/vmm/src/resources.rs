@@ -103,28 +103,31 @@ pub struct VmmConfig {
 }
 
 /// Everything `build_microvm_for_boot` needs to build guest memory as a mix
-/// of file-backed and anonymous regions instead of copying `kernel_bytes`/
-/// `initrd_bytes` into freshly-allocated anonymous memory - see
-/// `VmResources::zero_copy` and `joos/INIT.md`. All file offsets here are
-/// already absolute within `backing_path`, resolved by the caller (only
-/// knowable once the final binary exists - `joos-fire-patch` can move a
-/// section's *content* without moving its *offset*, but the offset itself
-/// isn't fixed until link time, hence not a build-time constant).
+/// of directly-mapped and anonymous regions instead of copying
+/// `kernel_bytes`/`initrd_bytes` into freshly-allocated anonymous memory -
+/// see `VmResources::zero_copy` and `joos/INIT.md`. Host addresses here
+/// point directly into `joos-fire`'s own already-mapped `VMLINUX_SLOT`/
+/// `INITRD_SLOT` statics (resolved by the caller via `slot_data(...).as_ptr()`)
+/// - wrapped with `MmapRegion::build_raw()` rather than a separate `mmap()`
+/// of `/proc/self/exe`, since the ELF loader already mapped this memory at
+/// process start. Requires those statics to be `static mut` (writable, not
+/// the default read-only an immutable `static` would get) since the guest
+/// genuinely writes into both regions - see the comment on `VMLINUX_SLOT`
+/// in `joos-fire`'s `main.rs`.
 #[derive(Debug, Clone, Copy)]
 pub struct ZeroCopyLayout {
-    /// Path to mmap regions from - in practice always `/proc/self/exe`.
-    pub backing_path: &'static str,
-    /// `(file_offset, guest_paddr, filesz, memsz)` per vmlinux `PT_LOAD`
-    /// segment, `file_offset` absolute within `backing_path`.
-    pub kernel_segments: &'static [(u64, u64, u64, u64)],
+    /// `(host_addr, guest_paddr, filesz, memsz)` per vmlinux `PT_LOAD`
+    /// segment - `host_addr` points directly at that segment's bytes within
+    /// the already-mapped `VMLINUX_SLOT`.
+    pub kernel_segments: &'static [(usize, u64, u64, u64)],
     /// Matches what `load_kernel()` would return via `EntryPoint`.
     pub kernel_entry_addr: u64,
     /// Whether `kernel_entry_addr` should be booted via PVH (a Xen
     /// `PHYS32_ENTRY` note was present) rather than the normal Linux boot
     /// protocol - see `Elf::load()` in the `linux-loader` crate.
     pub kernel_boot_protocol_is_pvh: bool,
-    /// Absolute file offset + size of the initrd blob within `backing_path`.
-    pub initrd_file_offset: u64,
+    /// Host address of the initrd blob (points directly into `INITRD_SLOT`).
+    pub initrd_host_addr: usize,
     /// Guest physical address to place the initrd at - computed by the
     /// caller ahead of guest memory construction using the same formula
     /// `arch::initrd_load_addr()` uses, since that formula needs to know

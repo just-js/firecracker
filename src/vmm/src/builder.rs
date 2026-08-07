@@ -176,13 +176,15 @@ fn try_build_zero_copy_regions(
     let dram_size = *size as u64;
     let page = crate::arch::host_page_size() as u64;
 
-    // One (start, end_exclusive, file_offset) window per file-backed piece
-    // (vmlinux PT_LOAD segments, split into a file-backed head + anonymous
-    // bss tail when filesz < memsz) plus one for the initrd blob.
-    let mut windows: Vec<(u64, u64, Option<u64>)> = Vec::new();
-    for &(file_off, paddr, filesz, memsz) in layout.kernel_segments {
+    // One (start, end_exclusive, host_addr) window per directly-wrapped
+    // piece (vmlinux PT_LOAD segments, split into a wrapped head + anonymous
+    // bss tail when filesz < memsz) plus one for the initrd blob. host_addr
+    // points directly into joos-fire's own VMLINUX_SLOT/INITRD_SLOT - see
+    // ZeroCopyLayout's doc comment.
+    let mut windows: Vec<(u64, u64, Option<usize>)> = Vec::new();
+    for &(host_addr, paddr, filesz, memsz) in layout.kernel_segments {
         let filesz_rounded = align_up_u64(filesz, page);
-        windows.push((paddr, paddr + filesz_rounded, Some(file_off)));
+        windows.push((paddr, paddr + filesz_rounded, Some(host_addr)));
         if memsz > filesz_rounded {
             windows.push((paddr + filesz_rounded, paddr + memsz, None));
         }
@@ -191,7 +193,7 @@ fn try_build_zero_copy_regions(
     windows.push((
         layout.initrd_guest_addr,
         layout.initrd_guest_addr + initrd_rounded,
-        Some(layout.initrd_file_offset),
+        Some(layout.initrd_host_addr),
     ));
     windows.sort_by_key(|w| w.0);
     for pair in windows.windows(2) {
@@ -215,31 +217,20 @@ fn try_build_zero_copy_regions(
         return None;
     }
 
-    let mut regions: Vec<(GuestAddress, usize, Option<u64>)> = Vec::new();
+    let mut regions: Vec<(GuestAddress, usize, Option<usize>)> = Vec::new();
     let mut cursor = 0u64;
-    for &(start, end, file_off) in &windows {
+    for &(start, end, host_addr) in &windows {
         if start > cursor {
             regions.push((GuestAddress(cursor), u64_to_usize(start - cursor), None));
         }
-        regions.push((GuestAddress(start), u64_to_usize(end - start), file_off));
+        regions.push((GuestAddress(start), u64_to_usize(end - start), host_addr));
         cursor = end;
     }
     if cursor < dram_size {
         regions.push((GuestAddress(cursor), u64_to_usize(dram_size - cursor), None));
     }
 
-    let file = match std::fs::File::open(layout.backing_path) {
-        Ok(f) => f,
-        Err(e) => {
-            crate::logger::warn!(
-                "joos-fire zero-copy: cannot open {}: {e} - falling back",
-                layout.backing_path
-            );
-            return None;
-        }
-    };
-
-    match crate::vstate::memory::mixed(&regions, &file, track_dirty_pages) {
+    match crate::vstate::memory::mixed(&regions, track_dirty_pages) {
         Ok(built) => Some(built),
         Err(e) => {
             crate::logger::warn!("joos-fire zero-copy: region construction failed: {e} - falling back to the copy-based path");
