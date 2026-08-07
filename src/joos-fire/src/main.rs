@@ -18,6 +18,7 @@ use vmm::logger::{LOGGER, LevelFilter, LoggerConfig};
 use vmm::resources::{VmResources, ZeroCopyLayout};
 use vmm::seccomp::get_empty_filters;
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
+use vmm::vmm_config::machine_config::HugePageConfig;
 use vmm::{EventManager, FcExitCode};
 
 
@@ -87,6 +88,18 @@ fn slot_data(slot: &'static [u8]) -> &'static [u8] {
     let n = slot.len();
     let len = u64::from_le_bytes(slot[n - 8..n].try_into().unwrap()) as usize;
     &slot[..len]
+}
+
+/// Reads the number of currently-free 2M hugetlbfs pages on this host, or
+/// `None` if the sysfs file doesn't exist (no hugetlbfs support/reservation
+/// at all) or doesn't parse - both treated as "don't use huge pages" by the
+/// caller, not a hard error.
+fn free_hugepages_2m() -> Option<usize> {
+    std::fs::read_to_string("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Minimal ELF64 section-header lookup against this process's own running
@@ -428,11 +441,62 @@ fn main() {
     // vstate/memory::mixed() runs before the KVM memory slot exists, so it
     // never actually avoids the per-page EPT-violation cost of the guest's
     // first touch (see INIT.md for the full dmesg-based root cause). Set
-    // JOOS_ZERO_COPY=1 to enable it anyway for further experimentation
-    // (e.g. a huge-page-backed version, tracked as an open discussion in
-    // INIT.md, not yet implemented).
+    // JOOS_ZERO_COPY=1 to enable it anyway for further experimentation. See
+    // JOOS_HUGE_ANON below for the follow-up attempt at the same root cause.
     if std::env::var_os("JOOS_ZERO_COPY").is_some() {
         vm_resources.zero_copy = try_build_zero_copy_layout(&vm_resources);
+    }
+
+    // Hugetlbfs-backed anonymous guest memory - see joos/INIT.md's "Plan:
+    // hugetlbfs-backed anonymous guest memory (candidate #1, take 2)" and
+    // its "Result" subsection. Unlike JOOS_ZERO_COPY above, this changes
+    // nothing about how vmlinux/initrd get loaded - load_kernel()/
+    // InitrdConfig::from_bytes() still do their normal memcpy, just into
+    // hugetlbfs-backed (real 2MB pages, pre-committed at mmap time) rather
+    // than plain anonymous (4KB, fault-allocated on demand) memory.
+    //
+    // On (auto-detected) by default, not opt-in: measured as a real, if
+    // modest, win with no observed downside - see INIT.md. Set
+    // FIRE_DISABLE_HUGE_PAGES=1 to force the plain-anonymous path anyway
+    // (e.g. for A/B benchmarking).
+    //
+    // HugePageConfig::Hugetlbfs2M backs the *entire* guest DRAM region, not
+    // just vmlinux/initrd - easy to assume otherwise, and wrong: confirmed
+    // directly (start fire2, watch /proc/meminfo's HugePages_Free drop
+    // while it runs) that hugetlbfs pages get consumed lazily as guest
+    // memory is actually touched, up to the *whole* configured
+    // mem_size_mib, not some smaller fixed amount. `mmap(MAP_HUGETLB)`
+    // itself can apparently succeed even when the host doesn't have enough
+    // *total* reserved pages to cover that full amount (observed: it
+    // didn't fail during a brief boot that only touched ~46MB against a
+    // 512MB guest with just 128MB reserved) - but a longer-running guest
+    // that touches more of its RAM than the host has reserved would run
+    // out mid-flight with no graceful fallback to 4K pages, since a
+    // MAP_HUGETLB mapping can't partially degrade like that. So the
+    // detection below requires enough *free* hugepages to cover the
+    // *entire* configured guest memory, not just "any are available" -
+    // anything less is unsafe for a guest that's actually used for real
+    // work (this project's whole point), not just a quick boot-and-check.
+    if std::env::var_os("FIRE_DISABLE_HUGE_PAGES").is_none() {
+        let mem_size_mib = vm_resources.machine_config.mem_size_mib;
+        if mem_size_mib % 2 != 0 {
+            eprintln!(
+                "[joos-fire] huge-pages: mem_size_mib ({mem_size_mib}) isn't a multiple of 2 - \
+                 using 4K pages"
+            );
+        } else {
+            let required_pages = mem_size_mib / 2;
+            match free_hugepages_2m() {
+                Some(free) if free >= required_pages => {
+                    vm_resources.machine_config.huge_pages = HugePageConfig::Hugetlbfs2M;
+                }
+                Some(free) => eprintln!(
+                    "[joos-fire] huge-pages: {free} free 2M hugepages, need {required_pages} to \
+                     cover the full {mem_size_mib}MiB guest - using 4K pages"
+                ),
+                None => {} // no hugetlbfs support/reservation on this host - silently use 4K pages
+            }
+        }
     }
 
     // Matches --no-seccomp on the stock firecracker launch this replaces.
