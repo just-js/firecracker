@@ -1,0 +1,16 @@
+[package]
+name = "joos-fire-patch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+object = { version = "0.36", default-features = false, features = ["read_core", "elf", "std"] }
+
+# Deliberately built via plain `cargo build` (no --release) - Cargo profiles
+# can only be set in the workspace root manifest, and per-package overrides
+# there can't touch `lto` at all (it's inherently whole-graph). Staying on
+# the dev profile sidesteps the workspace's lto=fat/codegen-units=1 release
+# settings entirely, which is what actually matters here: this is an
+# I/O-bound one-shot tool (read a few MB, write a few MB), not CPU-bound,
+# so unoptimized codegen shouldn't matter - and it means rebuilding this
+# crate (rarely, only when its own source changes) stays fast.
