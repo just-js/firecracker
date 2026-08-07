@@ -47,7 +47,15 @@ fn main() {
         let (offset, size) = section.file_range().unwrap_or_else(|| {
             fail(&format!("{fire2_path}: {section_name} has no file contents (bss?)"))
         });
-        let capacity = size - 8; // slot format: 8-byte LE length prefix + data + padding
+        // Slot format: data, zero padding, then an 8-byte LE length
+        // trailer at the very end (size - 8..size) - the length is a
+        // trailer rather than a prefix specifically so data starts at
+        // offset 0 of the slot (page-aligned, since the section itself is
+        // page-aligned - see PageAligned in joos-fire's main.rs) - required
+        // for joos/INIT.md's zero-copy `mmap()` plan. Must match
+        // build.rs's write_slot() exactly, since either one can be what
+        // last wrote this binary's slots.
+        let capacity = size - 8;
 
         let mut source = File::open(source_path)
             .unwrap_or_else(|e| fail(&format!("cannot open {source_path}: {e}")));
@@ -63,11 +71,11 @@ fn main() {
         }
 
         let mut buf = Vec::with_capacity(size as usize);
-        buf.extend_from_slice(&source_len.to_le_bytes());
         source
             .read_to_end(&mut buf)
             .unwrap_or_else(|e| fail(&format!("cannot read {source_path}: {e}")));
-        buf.resize(size as usize, 0);
+        buf.resize(capacity as usize, 0);
+        buf.extend_from_slice(&source_len.to_le_bytes());
 
         out.seek(SeekFrom::Start(offset))
             .unwrap_or_else(|e| fail(&format!("cannot seek {fire2_path}: {e}")));

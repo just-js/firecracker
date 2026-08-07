@@ -14,11 +14,11 @@ use linux_loader::cmdline::Cmdline as LoaderKernelCmdline;
 use userfaultfd::Uffd;
 use utils::time::TimestampUs;
 use vm_allocator::AllocPolicy;
-use vm_memory::GuestAddress;
+use vm_memory::{Address, GuestAddress};
 
 #[cfg(target_arch = "aarch64")]
 use crate::Vcpu;
-use crate::arch::{ConfigurationError, configure_system_for_boot, load_kernel};
+use crate::arch::{BootProtocol, ConfigurationError, EntryPoint, configure_system_for_boot, load_kernel};
 #[cfg(target_arch = "aarch64")]
 use crate::construct_kvm_mpidrs;
 use crate::cpu_config::templates::{GetCpuTemplate, GetCpuTemplateError, GuestConfigError};
@@ -47,7 +47,7 @@ use crate::persist::{MicrovmState, MicrovmStateError};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
-use crate::utils::mib_to_bytes;
+use crate::utils::{mib_to_bytes, u64_to_usize};
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfigError;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
@@ -137,6 +137,117 @@ impl std::convert::From<linux_loader::cmdline::Error> for StartMicrovmError {
     }
 }
 
+fn align_up_u64(addr: u64, align: u64) -> u64 {
+    (addr + align - 1) & !(align - 1)
+}
+
+/// Builds guest memory as a mix of file-backed (vmlinux/initrd, mapped
+/// directly from `layout.backing_path` - no copy) and anonymous regions,
+/// from a `ZeroCopyLayout` - see `VmResources::zero_copy` and
+/// `joos/INIT.md`'s "Plan: zero-copy vmlinux/initrd loading in VMM
+/// construction". Returns `None` (falls back to the normal
+/// `allocate_guest_memory()` + `load_kernel()` + `InitrdConfig::from_bytes()`
+/// path, unchanged) if anything about the current configuration doesn't
+/// match what this was written for - e.g. more than one top-level arch
+/// memory region, which only happens for guest memory sizes far larger than
+/// this project ever configures (crossing the 32-bit MMIO gap). Correctness
+/// is not worth risking boot on an unexpected layout, so every failure mode
+/// here is a logged fallback, never a hard error.
+fn try_build_zero_copy_regions(
+    layout: &crate::resources::ZeroCopyLayout,
+    mem_size_mib: usize,
+    track_dirty_pages: bool,
+) -> Option<Vec<crate::vstate::memory::GuestRegionMmap>> {
+    let arch_regions = crate::arch::arch_memory_regions(mib_to_bytes(mem_size_mib));
+    let [(start, size)] = arch_regions.as_slice() else {
+        crate::logger::warn!(
+            "joos-fire zero-copy: expected exactly one top-level guest memory region, got {} - \
+             falling back to the copy-based path",
+            arch_regions.len()
+        );
+        return None;
+    };
+    if start.raw_value() != 0 {
+        crate::logger::warn!(
+            "joos-fire zero-copy: expected guest memory to start at address 0 - falling back"
+        );
+        return None;
+    }
+    let dram_size = *size as u64;
+    let page = crate::arch::host_page_size() as u64;
+
+    // One (start, end_exclusive, file_offset) window per file-backed piece
+    // (vmlinux PT_LOAD segments, split into a file-backed head + anonymous
+    // bss tail when filesz < memsz) plus one for the initrd blob.
+    let mut windows: Vec<(u64, u64, Option<u64>)> = Vec::new();
+    for &(file_off, paddr, filesz, memsz) in layout.kernel_segments {
+        let filesz_rounded = align_up_u64(filesz, page);
+        windows.push((paddr, paddr + filesz_rounded, Some(file_off)));
+        if memsz > filesz_rounded {
+            windows.push((paddr + filesz_rounded, paddr + memsz, None));
+        }
+    }
+    let initrd_rounded = align_up_u64(layout.initrd_size, page);
+    windows.push((
+        layout.initrd_guest_addr,
+        layout.initrd_guest_addr + initrd_rounded,
+        Some(layout.initrd_file_offset),
+    ));
+    windows.sort_by_key(|w| w.0);
+    for pair in windows.windows(2) {
+        if pair[1].0 < pair[0].1 {
+            crate::logger::warn!(
+                "joos-fire zero-copy: overlapping regions ({:#x}-{:#x} vs {:#x}-{:#x}) - \
+                 falling back",
+                pair[0].0,
+                pair[0].1,
+                pair[1].0,
+                pair[1].1
+            );
+            return None;
+        }
+    }
+    if windows.last().map(|w| w.1).unwrap_or(0) > dram_size {
+        crate::logger::warn!(
+            "joos-fire zero-copy: a region extends past configured guest memory size - falling \
+             back"
+        );
+        return None;
+    }
+
+    let mut regions: Vec<(GuestAddress, usize, Option<u64>)> = Vec::new();
+    let mut cursor = 0u64;
+    for &(start, end, file_off) in &windows {
+        if start > cursor {
+            regions.push((GuestAddress(cursor), u64_to_usize(start - cursor), None));
+        }
+        regions.push((GuestAddress(start), u64_to_usize(end - start), file_off));
+        cursor = end;
+    }
+    if cursor < dram_size {
+        regions.push((GuestAddress(cursor), u64_to_usize(dram_size - cursor), None));
+    }
+
+    let file = match std::fs::File::open(layout.backing_path) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::logger::warn!(
+                "joos-fire zero-copy: cannot open {}: {e} - falling back",
+                layout.backing_path
+            );
+            return None;
+        }
+    };
+
+    match crate::vstate::memory::mixed(&regions, &file, track_dirty_pages) {
+        Ok(built) => Some(built),
+        Err(e) => {
+            crate::logger::warn!("joos-fire zero-copy: region construction failed: {e} - falling back to the copy-based path");
+            None
+        }
+    }
+}
+
 /// Builds and starts a microVM based on the current Firecracker VmResources configuration.
 ///
 /// The built microVM and all the created vCPUs start off in the paused state.
@@ -157,9 +268,30 @@ pub fn build_microvm_for_boot(
         .as_ref()
         .ok_or(StartMicrovmError::MissingKernelConfig)?;
 
-    let guest_memory = vm_resources
-        .allocate_guest_memory()
-        .map_err(StartMicrovmError::GuestMemory)?;
+    // If joos-fire set zero_copy, try building guest memory as a mix of
+    // file-backed (vmlinux/initrd, no copy) and anonymous regions instead
+    // of the normal allocate_guest_memory() - see try_build_zero_copy_regions
+    // and joos/INIT.md. zero_copy_active tracks whether that actually
+    // succeeded, since entry_point/initrd construction below must agree:
+    // if this fell back, load_kernel()/InitrdConfig::from_bytes() must still
+    // run normally (the mmap-based shortcut for their metadata is only
+    // valid if the mmap-based region construction it depends on happened).
+    let mut zero_copy_active = false;
+    let guest_memory = match vm_resources.zero_copy.as_ref().and_then(|layout| {
+        try_build_zero_copy_regions(
+            layout,
+            vm_resources.machine_config.mem_size_mib,
+            vm_resources.machine_config.track_dirty_pages,
+        )
+    }) {
+        Some(regions) => {
+            zero_copy_active = true;
+            regions
+        }
+        None => vm_resources
+            .allocate_guest_memory()
+            .map_err(StartMicrovmError::GuestMemory)?,
+    };
 
     // Clone the command-line so that a failed boot doesn't pollute the original.
     #[allow(unused_mut)]
@@ -205,22 +337,48 @@ pub fn build_microvm_for_boot(
     )?;
 
     let guest_memory = kvm_vm.guest_memory();
-    // If joos-fire (or anything else) set kernel_bytes/initrd_bytes, load
-    // directly from those in-process bytes instead of boot_config's File -
-    // see the field docs on VmResources for why this exists.
-    let entry_point = match vm_resources.kernel_bytes {
-        Some(bytes) => load_kernel(&mut io::Cursor::new(bytes), guest_memory)?,
-        None => {
-            let mut kernel_file = boot_config
-                .kernel_file
-                .try_clone()
-                .map_err(|_| ConfigurationError::KernelFile)?;
-            load_kernel(&mut kernel_file, guest_memory)?
-        }
-    };
-    let initrd = match vm_resources.initrd_bytes {
-        Some(bytes) => Some(InitrdConfig::from_bytes(guest_memory, bytes)?),
-        None => InitrdConfig::from_config(boot_config, guest_memory)?,
+    // If zero_copy_active, the vmlinux/initrd bytes are already correctly
+    // placed in guest memory via the file-backed regions built above - no
+    // load_kernel()/InitrdConfig::from_bytes() copy needed, just their
+    // metadata, which is fully derivable from ZeroCopyLayout (computed at
+    // build time in joos-fire's build.rs - see the comment there on why
+    // this exactly matches what Elf::load() would otherwise compute by
+    // copying first). Otherwise, if joos-fire (or anything else) set
+    // kernel_bytes/initrd_bytes, load directly from those in-process bytes
+    // instead of boot_config's File - see the field docs on VmResources.
+    let (entry_point, initrd) = if zero_copy_active {
+        // Safe to unwrap: zero_copy_active is only set when
+        // vm_resources.zero_copy was Some (see above).
+        let layout = vm_resources.zero_copy.as_ref().unwrap();
+        let entry_point = EntryPoint {
+            entry_addr: GuestAddress(layout.kernel_entry_addr),
+            protocol: if layout.kernel_boot_protocol_is_pvh {
+                BootProtocol::PvhBoot
+            } else {
+                BootProtocol::LinuxBoot
+            },
+        };
+        let initrd = Some(InitrdConfig {
+            address: GuestAddress(layout.initrd_guest_addr),
+            size: u64_to_usize(layout.initrd_size),
+        });
+        (entry_point, initrd)
+    } else {
+        let entry_point = match vm_resources.kernel_bytes {
+            Some(bytes) => load_kernel(&mut io::Cursor::new(bytes), guest_memory)?,
+            None => {
+                let mut kernel_file = boot_config
+                    .kernel_file
+                    .try_clone()
+                    .map_err(|_| ConfigurationError::KernelFile)?;
+                load_kernel(&mut kernel_file, guest_memory)?
+            }
+        };
+        let initrd = match vm_resources.initrd_bytes {
+            Some(bytes) => Some(InitrdConfig::from_bytes(guest_memory, bytes)?),
+            None => InitrdConfig::from_config(boot_config, guest_memory)?,
+        };
+        (entry_point, initrd)
     };
 
     if vm_resources.pci_enabled {

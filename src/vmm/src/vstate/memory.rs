@@ -77,6 +77,8 @@ pub enum MemoryError {
     SeekError(std::io::Error),
     /// Volatile memory error: {0}
     VolatileMemoryError(vm_memory::VolatileMemoryError),
+    /// Cannot clone backing file for a joos-fire zero-copy region: {0}
+    FileClone(std::io::Error),
 }
 
 impl From<vm_memory::VolatileMemoryError> for MemoryError {
@@ -544,6 +546,79 @@ pub fn create(
                 start,
             )
             .ok_or(MemoryError::VmMemoryError)
+        })
+        .collect::<Result<Vec<_>, _>>()
+}
+
+/// Creates a `Vec<GuestRegionMmap>` mixing arbitrary file-backed and
+/// anonymous regions in one pass - see joos/INIT.md's "Plan: zero-copy
+/// vmlinux/initrd loading in VMM construction". Each entry in `regions` is
+/// `(guest_start, size, file_offset)`: `Some(off)` maps that region
+/// `MAP_PRIVATE` from `file` at absolute offset `off` (every file-backed
+/// region here shares the same `file` - in practice all windows into this
+/// same running executable's embedded vmlinux/initrd slots); `None` maps it
+/// anonymous, same as `anonymous()` above. Unlike `create()`, file offsets
+/// are explicit per-region rather than auto-accumulated from 0, since a
+/// vmlinux's `PT_LOAD` segments are not contiguous in the source file.
+///
+/// File-backed regions are pre-populated here (read every page once from
+/// host userspace, right after `madvise(MADV_HUGEPAGE)`) before returning,
+/// so KVM never has to service an EPT violation for these pages during
+/// actual guest execution - see the microbenchmark results in INIT.md
+/// (`tools/mmap_bench.c`) for why this ordering (`madvise` *then* touch,
+/// not `MAP_POPULATE`) was chosen: it was the fastest of the variants
+/// tried, and applying `MADV_HUGEPAGE` after population was consistently
+/// worse than before it.
+pub fn mixed(
+    regions: &[(GuestAddress, usize, Option<u64>)],
+    file: &File,
+    track_dirty_pages: bool,
+) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+    let page_size = host_page_size();
+    regions
+        .iter()
+        .map(|&(start, size, file_offset)| {
+            let mut builder = MmapRegionBuilder::new_with_bitmap(
+                size,
+                track_dirty_pages.then(|| AtomicBitmap::with_len(size)),
+            )
+            .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE);
+
+            builder = match file_offset {
+                Some(off) => {
+                    let cloned = file.try_clone().map_err(MemoryError::FileClone)?;
+                    builder
+                        .with_mmap_flags(libc::MAP_NORESERVE | libc::MAP_PRIVATE)
+                        .with_file_offset(FileOffset::new(cloned, off))
+                }
+                None => builder.with_mmap_flags(
+                    libc::MAP_NORESERVE | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                ),
+            };
+
+            let region = builder.build().map_err(MemoryError::MmapRegionError)?;
+            let ptr = region.as_ptr();
+            // SAFETY: `ptr`/`size` describe the mapping just built above.
+            unsafe {
+                libc::madvise(ptr as *mut c_void, size, libc::MADV_HUGEPAGE);
+            }
+            if file_offset.is_some() {
+                // Pre-populate: touch one byte per page from host userspace
+                // now, so every page is already resident (and its EPT
+                // mapping trivially installable) by the time the guest
+                // touches it - avoids paying an EPT-violation VM-exit per
+                // page during boot instead.
+                let mut off = 0usize;
+                let mut sum: u8 = 0;
+                while off < size {
+                    // SAFETY: within the just-built mapping's bounds.
+                    sum ^= unsafe { std::ptr::read_volatile(ptr.add(off)) };
+                    off += page_size;
+                }
+                std::hint::black_box(sum);
+            }
+
+            GuestRegionMmap::new(region, start).ok_or(MemoryError::VmMemoryError)
         })
         .collect::<Result<Vec<_>, _>>()
 }

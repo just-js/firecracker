@@ -102,6 +102,38 @@ pub struct VmmConfig {
     pub memory_hotplug: Option<MemoryHotplugConfig>,
 }
 
+/// Everything `build_microvm_for_boot` needs to build guest memory as a mix
+/// of file-backed and anonymous regions instead of copying `kernel_bytes`/
+/// `initrd_bytes` into freshly-allocated anonymous memory - see
+/// `VmResources::zero_copy` and `joos/INIT.md`. All file offsets here are
+/// already absolute within `backing_path`, resolved by the caller (only
+/// knowable once the final binary exists - `joos-fire-patch` can move a
+/// section's *content* without moving its *offset*, but the offset itself
+/// isn't fixed until link time, hence not a build-time constant).
+#[derive(Debug, Clone, Copy)]
+pub struct ZeroCopyLayout {
+    /// Path to mmap regions from - in practice always `/proc/self/exe`.
+    pub backing_path: &'static str,
+    /// `(file_offset, guest_paddr, filesz, memsz)` per vmlinux `PT_LOAD`
+    /// segment, `file_offset` absolute within `backing_path`.
+    pub kernel_segments: &'static [(u64, u64, u64, u64)],
+    /// Matches what `load_kernel()` would return via `EntryPoint`.
+    pub kernel_entry_addr: u64,
+    /// Whether `kernel_entry_addr` should be booted via PVH (a Xen
+    /// `PHYS32_ENTRY` note was present) rather than the normal Linux boot
+    /// protocol - see `Elf::load()` in the `linux-loader` crate.
+    pub kernel_boot_protocol_is_pvh: bool,
+    /// Absolute file offset + size of the initrd blob within `backing_path`.
+    pub initrd_file_offset: u64,
+    /// Guest physical address to place the initrd at - computed by the
+    /// caller ahead of guest memory construction using the same formula
+    /// `arch::initrd_load_addr()` uses, since that formula needs to know
+    /// the final region layout, which doesn't exist yet at this point.
+    pub initrd_guest_addr: u64,
+    /// Size of the initrd blob in bytes.
+    pub initrd_size: u64,
+}
+
 /// A data structure that encapsulates the device configurations
 /// held in the Vmm.
 #[derive(Debug, Default)]
@@ -133,6 +165,16 @@ pub struct VmResources {
     pub kernel_bytes: Option<&'static [u8]>,
     /// Same idea as `kernel_bytes`, for the initrd.
     pub initrd_bytes: Option<&'static [u8]>,
+    /// If set (only by `joos-fire`), `build_microvm_for_boot` builds guest
+    /// memory as a mix of file-backed (mapping this same running
+    /// executable's `.joos_vmlinux`/`.joos_initrd` sections directly, no
+    /// copy) and anonymous regions, instead of calling
+    /// `allocate_guest_memory()` + `load_kernel()` +
+    /// `InitrdConfig::from_bytes()`. See `joos/INIT.md`'s "Plan: zero-copy
+    /// vmlinux/initrd loading in VMM construction". `kernel_bytes`/
+    /// `initrd_bytes` above are still required alongside this (used as the
+    /// fallback if zero-copy region construction fails for any reason).
+    pub zero_copy: Option<ZeroCopyLayout>,
     /// The optional Mmds data store.
     // This is initialised on demand (if ever used), so that we don't allocate it unless it's
     // actually used.

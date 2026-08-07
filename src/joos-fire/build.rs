@@ -15,6 +15,21 @@
 
 use std::path::{Path, PathBuf};
 
+// Note on candidate #1 in joos/INIT.md ("Plan: zero-copy vmlinux/initrd
+// loading in VMM construction"): vmlinux's PT_LOAD segment table/entry
+// point/PVH-boot-protocol flag used to be parsed *here*, at build time, and
+// baked into main.rs as compile-time constants. That's wrong: `make
+// patch-fire2` (tools/joos-fire-patch) overwrites a slot's *content*
+// in-place in an already-built `fire2` binary without ever re-running this
+// script - so build-time constants describing "the vmlinux that was present
+// during the last real `cargo build`" go silently stale the moment someone
+// hot-patches in a different vmlinux, and the VM boots pointed at the wrong
+// entry address for the bytes actually embedded (observed directly: instant
+// `Unexpected exit reason on vcpu run: Shutdown` after a hot-patch). Fixed
+// by moving this parsing to run at *runtime* in main.rs, against the
+// actually-embedded slot bytes (`slot_data(&VMLINUX_SLOT.0)`) every time -
+// see `parse_vmlinux_layout` there instead.
+
 // Defaults if JOOS_VMLINUX_MAX/JOOS_INITRD_MAX aren't set - current usage is
 // ~15.65MB/~6.2MB, so these have plenty of headroom out of the box. The
 // resolved values (default or overridden) get passed to main.rs via
@@ -50,10 +65,15 @@ fn resolve_size(env_var: &str, default: usize) -> usize {
     value
 }
 
-/// Writes `dest` as an 8-byte LE length prefix + `content` + zero padding to
-/// `capacity` total bytes (capacity here excludes the 8-byte prefix itself,
-/// matching how main.rs slices `[8..8+len]` out of a `capacity`-sized data
-/// region following the prefix).
+/// Writes `dest` as `content` + zero padding to `capacity` bytes + an 8-byte
+/// LE length trailer, `capacity + 8` bytes total. The length lives at the
+/// *end* (not the start) specifically so `content` begins at offset 0 of
+/// the slot - required for the zero-copy plan (joos/INIT.md) to `mmap()`
+/// this slot's section directly: content has to start at a page-aligned
+/// file offset, and while `PageAligned` (main.rs) makes the *section's own*
+/// offset page-aligned, an 8-byte prefix ahead of the content would still
+/// shift content 8 bytes past that alignment. `joos-fire-patch` must build
+/// the exact same layout when hot-patching - see its own write there.
 fn write_slot(dest: &Path, content: &[u8], capacity: usize) {
     if content.len() > capacity {
         panic!(
@@ -63,9 +83,9 @@ fn write_slot(dest: &Path, content: &[u8], capacity: usize) {
         );
     }
     let mut out = Vec::with_capacity(8 + capacity);
-    out.extend_from_slice(&(content.len() as u64).to_le_bytes());
     out.extend_from_slice(content);
-    out.resize(8 + capacity, 0);
+    out.resize(capacity, 0);
+    out.extend_from_slice(&(content.len() as u64).to_le_bytes());
     std::fs::write(dest, out).unwrap_or_else(|e| panic!("cannot write {dest:?}: {e}"));
 }
 
