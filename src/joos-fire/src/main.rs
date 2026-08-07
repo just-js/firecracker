@@ -416,13 +416,22 @@ fn main() {
     vm_resources.initrd_bytes = Some(slot_data(&INITRD_SLOT.0));
 
     // Zero-copy guest memory construction - see joos/INIT.md's "Plan:
-    // zero-copy vmlinux/initrd loading in VMM construction". kernel_bytes/
-    // initrd_bytes above stay set regardless, as the fallback path builder.rs
-    // takes if this isn't set (or the region construction it drives fails
-    // for any reason - see try_build_zero_copy_regions in builder.rs).
-    // JOOS_NO_ZERO_COPY=1 disables this for A/B benchmarking against the
-    // copy-based path.
-    if std::env::var_os("JOOS_NO_ZERO_COPY").is_none() {
+    // zero-copy vmlinux/initrd loading in VMM construction" and its
+    // "End-to-end result" subsection. kernel_bytes/initrd_bytes above stay
+    // set regardless, as the fallback path builder.rs takes if this isn't
+    // set (or the region construction it drives fails for any reason - see
+    // try_build_zero_copy_regions in builder.rs).
+    //
+    // Opt-in (off by default), not opt-out: measured end to end via
+    // bench_boot.sh, this currently makes fc_boot ~2x *worse* (~54ms vs
+    // ~24ms), not better - the host-side pre-population added to
+    // vstate/memory::mixed() runs before the KVM memory slot exists, so it
+    // never actually avoids the per-page EPT-violation cost of the guest's
+    // first touch (see INIT.md for the full dmesg-based root cause). Set
+    // JOOS_ZERO_COPY=1 to enable it anyway for further experimentation
+    // (e.g. a huge-page-backed version, tracked as an open discussion in
+    // INIT.md, not yet implemented).
+    if std::env::var_os("JOOS_ZERO_COPY").is_some() {
         vm_resources.zero_copy = try_build_zero_copy_layout(&vm_resources);
     }
 
