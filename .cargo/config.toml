@@ -1,7 +1,11 @@
 [build]
 target-dir = "build/cargo_target"
 rustflags = [
-  "-Ccodegen-units=1",
+  "-C", 
+  "link-arg=-fuse-ld=mold", 
+  "-Z", 
+  "threads=8", 
+  "-Ccodegen-units=1"
 ]
 
 [net]

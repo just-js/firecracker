@@ -4,7 +4,7 @@
 use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 
-use vm_memory::{GuestAddress, GuestMemory, ReadVolatile, VolatileMemoryError};
+use vm_memory::{Bytes, GuestAddress, GuestMemory, ReadVolatile, VolatileMemoryError};
 
 use crate::arch::initrd_load_addr;
 use crate::utils::u64_to_usize;
@@ -47,6 +47,25 @@ impl InitrdConfig {
                 Some(Self::from_file(vm_memory, f)?)
             }
             None => None,
+        })
+    }
+
+    /// Loads the initrd directly from an in-process byte slice into guest
+    /// memory (e.g. an `include_bytes!`'d initrd.cpio in an embedding binary
+    /// like `joos-fire`), instead of a `File` - see `from_file` below for
+    /// the file-based equivalent this project's stock boot path still uses.
+    pub fn from_bytes(vm_memory: &GuestMemoryMmap, data: &[u8]) -> Result<Self, InitrdError> {
+        let size = data.len();
+        let Some(address) = initrd_load_addr(vm_memory, size) else {
+            return Err(InitrdError::Address);
+        };
+        vm_memory
+            .write_slice(data, GuestAddress(address))
+            .map_err(|_| InitrdError::Load)?;
+
+        Ok(InitrdConfig {
+            address: GuestAddress(address),
+            size,
         })
     }
 

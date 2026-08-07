@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::SeekFrom;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
+use libc::c_void;
 
 use bitvec::vec::BitVec;
 use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
@@ -533,8 +534,13 @@ pub fn create(
                 Some(new_off) => new_off,
             };
 
+            let region = builder.build().map_err(MemoryError::MmapRegionError)?;
+            unsafe {
+                libc::madvise(region.as_ptr() as *mut c_void, size, libc::MADV_HUGEPAGE);
+            }
+
             GuestRegionMmap::new(
-                builder.build().map_err(MemoryError::MmapRegionError)?,
+                region,
                 start,
             )
             .ok_or(MemoryError::VmMemoryError)

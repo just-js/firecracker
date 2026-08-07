@@ -836,6 +836,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "joos-fire"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "vmm",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.98"
 source = "registry+https://github.com/rust-lang/crates.io-index"

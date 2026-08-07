@@ -1,0 +1,90 @@
+// A custom firecracker launcher that embeds vmlinux/initrd.cpio/config
+// directly (see build.rs) and calls vmm's VMM-construction API in-process,
+// instead of this project's usual wrapper (memfd_create + write + fexecve
+// into a stock firecracker binary). Eliminates that wrapper's ~10-11ms of
+// memfd writes entirely - see FIRECRACKER.md and BOOT_PROFILE.md in the
+// parent joos project for the full reasoning and measurements.
+//
+// No control/API socket - this is deliberately the run-without-api
+// equivalent of firecracker's own main.rs, with the HTTP API server left
+// out entirely, matching how this project actually uses firecracker today
+// (single-shot boot, no interactive API calls).
+//
+// Expects fire.ext4 in the current directory, same as build/fire.
+
+use vmm::builder::build_and_boot_microvm;
+use vmm::logger::{LOGGER, LevelFilter, LoggerConfig};
+use vmm::resources::VmResources;
+use vmm::seccomp::get_empty_filters;
+use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
+use vmm::{EventManager, FcExitCode};
+
+static VMLINUX: &[u8] = include_bytes!(env!("JOOS_VMLINUX_PATH"));
+static INITRD: &[u8] = include_bytes!(env!("JOOS_INITRD_PATH"));
+static CONFIG_JSON: &str = include_str!(env!("JOOS_CONFIG_PATH"));
+
+fn main() {
+    // Matches the wrapper's unlink() of stale sockets from a previous run -
+    // vsock's bind() fails with EADDRINUSE otherwise. No fire.sock/API
+    // socket to worry about here since there's no API server in this binary.
+    let _ = std::fs::remove_file("./v.sock");
+
+    // Without this, log::warn!/info! (used by e.g. the boot-timer device's
+    // Guest-boot-time line) are silent no-ops - firecracker's own main.rs
+    // does this via its --level CLI arg, which joos-fire doesn't have.
+    LOGGER.init().expect("failed to init logger");
+    LOGGER
+        .update(LoggerConfig {
+            log_path: None,
+            level: Some(LevelFilter::Warn),
+            show_level: None,
+            show_log_origin: None,
+            module: None,
+        })
+        .expect("failed to configure logger level");
+
+    let instance_info = InstanceInfo {
+        id: "anonymous-instance".to_string(),
+        state: VmState::NotStarted,
+        vmm_version: "joos-fire".to_string(),
+        app_name: "joos-fire".to_string(),
+    };
+
+    let mut event_manager = EventManager::new().expect("failed to create EventManager");
+
+    let mut vm_resources = VmResources::from_json(CONFIG_JSON, &instance_info, 0, None)
+        .expect("failed to parse embedded config JSON");
+    // Matches --boot-timer on the stock firecracker launch this replaces.
+    vm_resources.boot_timer = true;
+    // The whole point: load straight from the embedded bytes above, instead
+    // of boot_source.builder's File (which the embedded config's patched
+    // boot-source section deliberately points at /dev/null - see build.rs).
+    vm_resources.kernel_bytes = Some(VMLINUX);
+    vm_resources.initrd_bytes = Some(INITRD);
+
+    // Matches --no-seccomp on the stock firecracker launch this replaces.
+    let seccomp_filters = get_empty_filters();
+
+    let vmm = build_and_boot_microvm(
+        &instance_info,
+        &vm_resources,
+        &mut event_manager,
+        &seccomp_filters,
+    )
+    .expect("failed to build/boot microVM");
+
+    // Same event loop firecracker's own main.rs runs post-construction -
+    // this is what actually keeps devices/vsock functioning, not just the
+    // build_and_boot_microvm call above.
+    loop {
+        event_manager.run().expect("event manager run failed");
+        match vmm.lock().unwrap().shutdown_exit_code() {
+            Some(FcExitCode::Ok) => break,
+            Some(exit_code) => {
+                eprintln!("[joos-fire] shutdown with exit code {exit_code:?}");
+                std::process::exit(exit_code as i32);
+            }
+            None => continue,
+        }
+    }
+}

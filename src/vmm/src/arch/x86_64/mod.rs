@@ -32,7 +32,9 @@ pub mod xstate;
 pub mod generated;
 
 use std::cmp::max;
-use std::fs::File;
+use std::io::{Read, Seek};
+
+use vm_memory::ReadVolatile;
 
 use super::EntryPoint;
 use crate::acpi::create_acpi_tables;
@@ -429,20 +431,22 @@ fn add_e820_entry(
 }
 
 /// Load linux kernel into guest memory.
-pub fn load_kernel(
-    kernel: &File,
+///
+/// Generic over the source (`File` for the on-disk/fd-based path, or e.g.
+/// `Cursor<&[u8]>` for an in-process embedded kernel image - see `joos-fire`
+/// in this workspace, which passes a `Cursor` over an `include_bytes!`'d
+/// vmlinux directly, skipping the memfd-based extraction this project's
+/// wrapper otherwise needs). `linux_loader::loader::elf::Elf::load` already
+/// supports this generically; this function was previously narrowing that
+/// down to `&File` for no functional reason.
+pub fn load_kernel<F: Read + ReadVolatile + Seek>(
+    kernel: &mut F,
     guest_memory: &GuestMemoryMmap,
 ) -> Result<EntryPoint, ConfigurationError> {
-    // Need to clone the File because reading from it
-    // mutates it.
-    let mut kernel_file = kernel
-        .try_clone()
-        .map_err(|_| ConfigurationError::KernelFile)?;
-
     let entry_addr = Loader::load(
         guest_memory,
         None,
-        &mut kernel_file,
+        kernel,
         Some(GuestAddress(get_kernel_start())),
     )
     .map_err(ConfigurationError::KernelLoader)?;

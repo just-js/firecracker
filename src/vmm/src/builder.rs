@@ -205,8 +205,23 @@ pub fn build_microvm_for_boot(
     )?;
 
     let guest_memory = kvm_vm.guest_memory();
-    let entry_point = load_kernel(&boot_config.kernel_file, guest_memory)?;
-    let initrd = InitrdConfig::from_config(boot_config, guest_memory)?;
+    // If joos-fire (or anything else) set kernel_bytes/initrd_bytes, load
+    // directly from those in-process bytes instead of boot_config's File -
+    // see the field docs on VmResources for why this exists.
+    let entry_point = match vm_resources.kernel_bytes {
+        Some(bytes) => load_kernel(&mut io::Cursor::new(bytes), guest_memory)?,
+        None => {
+            let mut kernel_file = boot_config
+                .kernel_file
+                .try_clone()
+                .map_err(|_| ConfigurationError::KernelFile)?;
+            load_kernel(&mut kernel_file, guest_memory)?
+        }
+    };
+    let initrd = match vm_resources.initrd_bytes {
+        Some(bytes) => Some(InitrdConfig::from_bytes(guest_memory, bytes)?),
+        None => InitrdConfig::from_config(boot_config, guest_memory)?,
+    };
 
     if vm_resources.pci_enabled {
         device_manager.enable_pci(&kvm_vm)?;

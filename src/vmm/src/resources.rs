@@ -124,6 +124,15 @@ pub struct VmResources {
     pub pmem: PmemBuilder,
     /// The memory hotplug configuration.
     pub memory_hotplug: Option<MemoryHotplugConfig>,
+    /// If set, `build_microvm_for_boot` loads the kernel from these bytes
+    /// directly (e.g. an `include_bytes!`'d vmlinux in an embedding binary
+    /// like `joos-fire`) instead of `boot_source.builder`'s `kernel_file`.
+    /// See `joos-fire` in this workspace and `FIRECRACKER.md`/`BOOT_PROFILE.md`
+    /// in the parent `joos` project for why this exists. `None` (the
+    /// default) preserves today's file-based behavior exactly.
+    pub kernel_bytes: Option<&'static [u8]>,
+    /// Same idea as `kernel_bytes`, for the initrd.
+    pub initrd_bytes: Option<&'static [u8]>,
     /// The optional Mmds data store.
     // This is initialised on demand (if ever used), so that we don't allocate it unless it's
     // actually used.
