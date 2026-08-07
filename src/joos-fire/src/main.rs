@@ -19,9 +19,31 @@ use vmm::seccomp::get_empty_filters;
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
 use vmm::{EventManager, FcExitCode};
 
-// Must match the MAX constants in build.rs.
-const VMLINUX_MAX: usize = 24 * 1024 * 1024;
-const INITRD_MAX: usize = 12 * 1024 * 1024;
+/// Parses an ASCII-digit-only compile-time string into a `usize`, for
+/// turning `env!("JOOS_VMLINUX_MAX")` (build.rs's resolved slot capacity,
+/// see resolve_size() there) into an array-size constant. `str::parse`
+/// isn't const-evaluable, hence the manual byte-by-byte parse.
+const fn parse_usize(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut result: usize = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        assert!(b.is_ascii_digit(), "JOOS_*_MAX must be a plain integer (bytes)");
+        result = result * 10 + (b - b'0') as usize;
+        i += 1;
+    }
+    result
+}
+
+// Configurable at build time, e.g. `JOOS_VMLINUX_MAX=33554432 cargo build
+// ...` (see the Makefile) - build.rs resolves these (with defaults) and
+// re-exports them via cargo:rustc-env, so the value read here always
+// matches what build.rs padded the slot files to. CONFIG_MAX isn't
+// build-time-configurable (config is tiny, unlikely to need it) but could
+// be given the same treatment if that changes.
+const VMLINUX_MAX: usize = parse_usize(env!("JOOS_VMLINUX_MAX"));
+const INITRD_MAX: usize = parse_usize(env!("JOOS_INITRD_MAX"));
 const CONFIG_MAX: usize = 64 * 1024;
 
 // Each slot lives in its own dedicated ELF section (rather than sharing

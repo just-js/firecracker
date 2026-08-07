@@ -15,9 +15,13 @@
 
 use std::path::{Path, PathBuf};
 
-// Must match the MAX constants in src/main.rs.
-const VMLINUX_MAX: usize = 24 * 1024 * 1024;
-const INITRD_MAX: usize = 12 * 1024 * 1024;
+// Defaults if JOOS_VMLINUX_MAX/JOOS_INITRD_MAX aren't set - current usage is
+// ~15.65MB/~6.2MB, so these have plenty of headroom out of the box. The
+// resolved values (default or overridden) get passed to main.rs via
+// cargo:rustc-env below, so build.rs's padding and main.rs's array sizes
+// always agree - no hardcoded constant to keep in sync by hand anymore.
+const DEFAULT_VMLINUX_MAX: usize = 24 * 1024 * 1024;
+const DEFAULT_INITRD_MAX: usize = 12 * 1024 * 1024;
 const CONFIG_MAX: usize = 64 * 1024;
 
 fn resolve(env_var: &str, default_rel: &str) -> PathBuf {
@@ -26,6 +30,24 @@ fn resolve(env_var: &str, default_rel: &str) -> PathBuf {
     let path = Path::new(&manifest_dir).join(raw);
     path.canonicalize()
         .unwrap_or_else(|e| panic!("{env_var}: cannot resolve {path:?}: {e}"))
+}
+
+/// Resolves a slot capacity from an env var (e.g. `JOOS_VMLINUX_MAX=33554432
+/// cargo build ...`), falling back to `default`, and re-exports the
+/// resolved value via `cargo:rustc-env` so main.rs's `env!()` always sees
+/// the exact same number build.rs used to pad the slot file with.
+fn resolve_size(env_var: &str, default: usize) -> usize {
+    let value = std::env::var(env_var)
+        .ok()
+        .filter(|v| !v.is_empty()) // e.g. `JOOS_VMLINUX_MAX=` from an unset Makefile var
+        .map(|v| {
+            v.parse::<usize>()
+                .unwrap_or_else(|e| panic!("{env_var}={v:?}: not a valid size in bytes: {e}"))
+        })
+        .unwrap_or(default);
+    println!("cargo:rustc-env={env_var}={value}");
+    println!("cargo:rerun-if-env-changed={env_var}");
+    value
 }
 
 /// Writes `dest` as an 8-byte LE length prefix + `content` + zero padding to
@@ -54,18 +76,21 @@ fn main() {
     let initrd = resolve("JOOS_INITRD", "initrd.cpio");
     let config_src = resolve("JOOS_CONFIG", "fire_mem.json");
 
+    let vmlinux_max = resolve_size("JOOS_VMLINUX_MAX", DEFAULT_VMLINUX_MAX);
+    let initrd_max = resolve_size("JOOS_INITRD_MAX", DEFAULT_INITRD_MAX);
+
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
     let vmlinux_bytes =
         std::fs::read(&vmlinux).unwrap_or_else(|e| panic!("cannot read {vmlinux:?}: {e}"));
     let vmlinux_slot = Path::new(&out_dir).join("vmlinux.slot");
-    write_slot(&vmlinux_slot, &vmlinux_bytes, VMLINUX_MAX);
+    write_slot(&vmlinux_slot, &vmlinux_bytes, vmlinux_max);
     println!("cargo:rustc-env=JOOS_VMLINUX_SLOT_PATH={}", vmlinux_slot.display());
 
     let initrd_bytes =
         std::fs::read(&initrd).unwrap_or_else(|e| panic!("cannot read {initrd:?}: {e}"));
     let initrd_slot = Path::new(&out_dir).join("initrd.slot");
-    write_slot(&initrd_slot, &initrd_bytes, INITRD_MAX);
+    write_slot(&initrd_slot, &initrd_bytes, initrd_max);
     println!("cargo:rustc-env=JOOS_INITRD_SLOT_PATH={}", initrd_slot.display());
 
     let raw = std::fs::read_to_string(&config_src)
