@@ -36,7 +36,7 @@ use crate::devices::virtio::mem::{VIRTIO_MEM_DEFAULT_SLOT_SIZE_MIB, VirtioMem};
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::pmem::device::Pmem;
 use crate::devices::virtio::rng::Entropy;
-use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
+use crate::devices::virtio::vsock::{Vsock, VsockBackend};
 #[cfg(feature = "gdb")]
 use crate::gdb;
 use crate::initrd::{InitrdConfig, InitrdError};
@@ -137,6 +137,24 @@ impl std::convert::From<linux_loader::cmdline::Error> for StartMicrovmError {
     }
 }
 
+/// A hook letting a caller (e.g. `joos-fire`) attach one extra virtio device of
+/// a type `vmm` itself doesn't know about, at the same point in construction
+/// `attach_vsock_device` normally runs for the stock UDS-backed vsock device -
+/// i.e. before the kernel command line is finalized (so a
+/// `virtio_mmio.device=...` entry added here still reaches the guest) but
+/// after the rest of the device set is up. See joos/doc/TERMINAL.md - this
+/// exists so a custom `VsockBackend` (or any other `VirtioDevice`)
+/// implementation can live entirely in a downstream crate, without `vmm` ever
+/// naming its concrete type.
+pub type ExtraDeviceHook = Box<
+    dyn FnOnce(
+        &mut device_manager::DeviceManager,
+        &Vm,
+        &mut LoaderKernelCmdline,
+        &mut EventManager,
+    ) -> Result<(), AttachDeviceError>,
+>;
+
 /// Builds and starts a microVM based on the current Firecracker VmResources configuration.
 ///
 /// The built microVM and all the created vCPUs start off in the paused state.
@@ -147,6 +165,34 @@ pub fn build_microvm_for_boot(
     vm_resources: &super::resources::VmResources,
     event_manager: &mut EventManager,
     seccomp_filters: &BpfThreadMap,
+) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    build_microvm_for_boot_impl(instance_info, vm_resources, event_manager, seccomp_filters, None)
+}
+
+/// Identical to [`build_microvm_for_boot`], but also runs `extra_device_hook`
+/// (if given) during device construction - see [`ExtraDeviceHook`].
+pub fn build_microvm_for_boot_with_extra_device(
+    instance_info: &InstanceInfo,
+    vm_resources: &super::resources::VmResources,
+    event_manager: &mut EventManager,
+    seccomp_filters: &BpfThreadMap,
+    extra_device_hook: ExtraDeviceHook,
+) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    build_microvm_for_boot_impl(
+        instance_info,
+        vm_resources,
+        event_manager,
+        seccomp_filters,
+        Some(extra_device_hook),
+    )
+}
+
+fn build_microvm_for_boot_impl(
+    instance_info: &InstanceInfo,
+    vm_resources: &super::resources::VmResources,
+    event_manager: &mut EventManager,
+    seccomp_filters: &BpfThreadMap,
+    extra_device_hook: Option<ExtraDeviceHook>,
 ) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     // Timestamp for measuring microVM boot duration.
     let request_ts = TimestampUs::default();
@@ -269,13 +315,17 @@ pub fn build_microvm_for_boot(
     )?;
 
     if let Some(unix_vsock) = vm_resources.vsock.get() {
-        attach_unixsock_vsock_device(
+        attach_vsock_device(
             &mut device_manager,
             &vm,
             &mut boot_cmdline,
             unix_vsock,
             event_manager,
         )?;
+    }
+
+    if let Some(hook) = extra_device_hook {
+        hook(&mut device_manager, &vm, &mut boot_cmdline, event_manager)?;
     }
 
     if let Some(entropy) = vm_resources.entropy.get() {
@@ -400,6 +450,31 @@ pub fn build_and_boot_microvm(
 ) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     debug!("event_start: build microvm for boot");
     let vmm = build_microvm_for_boot(instance_info, vm_resources, event_manager, seccomp_filters)?;
+    debug!("event_end: build microvm for boot");
+    // The vcpus start off in the `Paused` state, let them run.
+    debug!("event_start: boot microvm");
+    vmm.lock().unwrap().resume_vm()?;
+    debug!("event_end: boot microvm");
+    Ok(vmm)
+}
+
+/// Identical to [`build_and_boot_microvm`], but also runs `extra_device_hook`
+/// (if given) during device construction - see [`ExtraDeviceHook`].
+pub fn build_and_boot_microvm_with_extra_device(
+    instance_info: &InstanceInfo,
+    vm_resources: &super::resources::VmResources,
+    event_manager: &mut EventManager,
+    seccomp_filters: &BpfThreadMap,
+    extra_device_hook: ExtraDeviceHook,
+) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    debug!("event_start: build microvm for boot");
+    let vmm = build_microvm_for_boot_with_extra_device(
+        instance_info,
+        vm_resources,
+        event_manager,
+        seccomp_filters,
+        extra_device_hook,
+    )?;
     debug!("event_end: build microvm for boot");
     // The vcpus start off in the `Paused` state, let them run.
     debug!("event_start: boot microvm");
@@ -771,16 +846,19 @@ fn attach_pmem_devices(
     Ok(())
 }
 
-fn attach_unixsock_vsock_device(
+/// Generic over any `VsockBackend`, not just `VsockUnixBackend` - `pub` so a
+/// downstream crate's `ExtraDeviceHook` (see above) can attach its own vsock
+/// backend the same way this module attaches the stock UDS one below.
+pub fn attach_vsock_device<B: VsockBackend + std::fmt::Debug + 'static>(
     device_manager: &mut DeviceManager,
     vm: &Vm,
     cmdline: &mut LoaderKernelCmdline,
-    unix_vsock: &Arc<Mutex<Vsock<VsockUnixBackend>>>,
+    vsock: &Arc<Mutex<Vsock<B>>>,
     event_manager: &mut EventManager,
 ) -> Result<(), AttachDeviceError> {
-    let id = String::from(unix_vsock.lock().expect("Poisoned lock").id());
+    let id = String::from(vsock.lock().expect("Poisoned lock").id());
     // The device mutex mustn't be locked here otherwise it will deadlock.
-    device_manager.attach_virtio_device(vm, id, unix_vsock.clone(), cmdline, event_manager, false)
+    device_manager.attach_virtio_device(vm, id, vsock.clone(), cmdline, event_manager, false)
 }
 
 fn attach_balloon_device(
@@ -996,7 +1074,7 @@ pub(crate) mod tests {
         let vsock = VsockBuilder::create_unixsock_vsock(vsock_config).unwrap();
         let vsock = Arc::new(Mutex::new(vsock));
 
-        attach_unixsock_vsock_device(
+        attach_vsock_device(
             &mut vmm.device_manager,
             &vmm.vm,
             cmdline,

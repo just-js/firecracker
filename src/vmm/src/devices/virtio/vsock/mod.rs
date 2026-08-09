@@ -11,7 +11,13 @@
 //! mediates communication between AF_UNIX sockets (on the host end) and AF_VSOCK
 //! sockets (on the guest end).
 
-mod csm;
+// `csm` (the vsock protocol state machine, generic over any host-side
+// `ReadVolatile + Write + WriteVolatile + AsRawFd` stream) and the packet types
+// are made public here (both were previously crate-internal to this module)
+// specifically so a custom `VsockBackend` implementation can live entirely
+// outside this crate - see joos-fire's own vsock backend and joos/doc/TERMINAL.md.
+// No new logic added by that change, purely visibility.
+pub mod csm;
 mod device;
 mod event_handler;
 pub mod metrics;
@@ -27,7 +33,7 @@ use vmm_sys_util::epoll::EventSet;
 
 pub use self::defs::VSOCK_DEV_ID;
 pub use self::device::Vsock;
-use self::packet::{VsockPacketRx, VsockPacketTx};
+pub use self::packet::{VsockPacketRx, VsockPacketTx};
 pub use self::unix::{VsockUnixBackend, VsockUnixBackendError};
 use super::iov_deque::IovDequeError;
 use crate::devices::virtio::iovec::IoVecError;

@@ -839,8 +839,11 @@ dependencies = [
 name = "joos-fire"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde_json",
+ "vm-memory",
  "vmm",
+ "vmm-sys-util",
 ]
 
 [[package]]

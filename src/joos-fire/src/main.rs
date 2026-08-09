@@ -12,13 +12,16 @@
 //
 // Expects fire.ext4 in the current directory, same as build/fire.
 
-use vmm::builder::build_and_boot_microvm;
+use vmm::builder::{build_and_boot_microvm, build_and_boot_microvm_with_extra_device};
 use vmm::logger::{LOGGER, LevelFilter, LoggerConfig};
 use vmm::resources::VmResources;
 use vmm::seccomp::get_empty_filters;
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
 use vmm::vmm_config::machine_config::HugePageConfig;
 use vmm::{EventManager, FcExitCode};
+
+mod terminal_vsock;
+use terminal_vsock::TerminalVsockBackend;
 
 /// Parses an ASCII-digit-only compile-time string into a `usize`, for
 /// turning `env!("JOOS_VMLINUX_MAX")` (build.rs's resolved slot capacity,
@@ -180,12 +183,38 @@ fn main() {
     // Matches --no-seccomp on the stock firecracker launch this replaces.
     let seccomp_filters = get_empty_filters();
 
-    let vmm = build_and_boot_microvm(
-        &instance_info,
-        &vm_resources,
-        &mut event_manager,
-        &seccomp_filters,
-    )
+    // TEMPORARY prototype gate for doc/TERMINAL.md's custom vsock backend -
+    // still hardcoded (one fixed port, no data/resize split, no shell/pty
+    // wiring yet), but the connection direction (guest-initiated) and backend
+    // logic are the real design now, not just a diagnostic - see
+    // doc/TERMINAL.md's "Reconsidering connection direction". guest_cid=3
+    // matches fire_mem.json (fire_mem.json's own "vsock" section must be
+    // removed for now - see doc/TERMINAL.md, only one vsock device per VM);
+    // listen_port is an arbitrary host-side port the guest connects out to.
+    let vmm = if std::env::var_os("JOOS_TERMINAL_VSOCK_PROTOTYPE").is_some() {
+        let hook: vmm::builder::ExtraDeviceHook = Box::new(|device_manager, vm, cmdline, event_manager| {
+            let backend = TerminalVsockBackend::new_listening(libc::STDIN_FILENO, 2, 9999);
+            let terminal_vsock = std::sync::Arc::new(std::sync::Mutex::new(
+                vmm::devices::virtio::vsock::Vsock::new(3, backend)
+                    .expect("failed to create prototype terminal vsock device"),
+            ));
+            vmm::builder::attach_vsock_device(device_manager, vm, cmdline, &terminal_vsock, event_manager)
+        });
+        build_and_boot_microvm_with_extra_device(
+            &instance_info,
+            &vm_resources,
+            &mut event_manager,
+            &seccomp_filters,
+            hook,
+        )
+    } else {
+        build_and_boot_microvm(
+            &instance_info,
+            &vm_resources,
+            &mut event_manager,
+            &seccomp_filters,
+        )
+    }
     .expect("failed to build/boot microVM");
 
     // Same event loop firecracker's own main.rs runs post-construction -
