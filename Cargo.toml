@@ -36,9 +36,6 @@ panic = "abort"
 
 [profile.release]
 panic = "abort"
-lto = "fat"
-strip = "debuginfo"
-codegen-units = 1
 
 [profile.bench]
 strip = "debuginfo"
