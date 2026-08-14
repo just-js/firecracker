@@ -12,8 +12,21 @@ use acpi_tables::aml::AmlError;
 use acpi_tables::{Aml, aml};
 
 use crate::devices::legacy::{I8042Device, SerialDevice};
-use crate::vstate::bus::BusError;
+use crate::vstate::bus::{BusDevice, BusError};
 use crate::vstate::vm::KvmVm;
+
+/// Stub for the x86 CMOS/RTC index+data ports (0x70-0x71).
+///
+/// Firecracker doesn't model a CMOS/RTC device, but Linux's SMP AP
+/// bring-up path pokes these ports once per additional vCPU regardless
+/// (the "shutdown status byte" dance) and nothing ever reads the result.
+/// Owning the ports with a device that no-ops both `read` and `write`
+/// (the `BusDevice` defaults) is enough to stop them surfacing as
+/// unhandled bus errors.
+#[derive(Debug, Default)]
+pub struct CmosStub;
+
+impl BusDevice for CmosStub {}
 
 /// Errors corresponding to the `PortIODeviceManager`.
 #[derive(Debug, derive_more::From, thiserror::Error, displaydoc::Display)]
@@ -32,6 +45,8 @@ pub struct PortIODeviceManager {
     pub stdio_serial: Arc<Mutex<SerialDevice>>,
     // BusDevice::I8042Device
     pub i8042: Arc<Mutex<I8042Device>>,
+    // BusDevice::CmosStub
+    pub cmos: Arc<Mutex<CmosStub>>,
 }
 
 impl PortIODeviceManager {
@@ -50,6 +65,11 @@ impl PortIODeviceManager {
     const I8042_KDB_DATA_REGISTER_ADDRESS: u64 = 0x060;
     /// i8042 keyboard data register size.
     const I8042_KDB_DATA_REGISTER_SIZE: u64 = 0x5;
+    /// CMOS/RTC index+data port address. See
+    /// <https://wiki.osdev.org/CMOS#Register_Selection>.
+    const CMOS_PORT_ADDRESS: u64 = 0x070;
+    /// CMOS/RTC index+data port size (covers 0x70 and 0x71).
+    const CMOS_PORT_SIZE: u64 = 0x2;
 
     /// Register supported legacy devices.
     pub fn register_devices(&mut self, vm: &KvmVm) -> Result<(), LegacyDeviceError> {
@@ -63,6 +83,11 @@ impl PortIODeviceManager {
             self.i8042.clone(),
             Self::I8042_KDB_DATA_REGISTER_ADDRESS,
             Self::I8042_KDB_DATA_REGISTER_SIZE,
+        )?;
+        io_bus.insert(
+            self.cmos.clone(),
+            Self::CMOS_PORT_ADDRESS,
+            Self::CMOS_PORT_SIZE,
         )?;
 
         vm.register_irq(
@@ -171,6 +196,7 @@ mod tests {
             i8042: Arc::new(Mutex::new(
                 I8042Device::new(EventFd::new(libc::EFD_NONBLOCK).unwrap()).unwrap(),
             )),
+            cmos: Arc::new(Mutex::new(CmosStub::default())),
         };
         ldm.register_devices(&vm).unwrap();
     }

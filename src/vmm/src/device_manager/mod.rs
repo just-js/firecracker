@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use acpi::ACPIDeviceManager;
 use event_manager::{MutEventSubscriber, SubscriberOps};
 #[cfg(target_arch = "x86_64")]
-use legacy::{LegacyDeviceError, PortIODeviceManager};
+use legacy::{CmosStub, LegacyDeviceError, PortIODeviceManager};
 use linux_loader::loader::Cmdline;
 use mmio::{MMIODeviceManager, MmioError};
 use pci_mngr::{PciDevices, PciDevicesConstructorArgs, PciManagerError};
@@ -221,6 +221,7 @@ impl DeviceManager {
         let mut legacy_devices = PortIODeviceManager {
             stdio_serial: serial,
             i8042,
+            cmos: Arc::new(Mutex::new(CmosStub::default())),
         };
         legacy_devices.register_devices(vm)?;
         Ok(legacy_devices)
@@ -814,6 +815,7 @@ pub(crate) mod tests {
             i8042: Arc::new(Mutex::new(
                 I8042Device::new(EventFd::new(libc::EFD_NONBLOCK).unwrap()).unwrap(),
             )),
+            cmos: Arc::new(Mutex::new(CmosStub::default())),
         };
 
         DeviceManager {
