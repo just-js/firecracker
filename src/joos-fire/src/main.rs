@@ -98,7 +98,7 @@ fn main() {
     LOGGER
         .update(LoggerConfig {
             log_path: None,
-            level: Some(LevelFilter::Warn),
+            level: Some(LevelFilter::Error),
             show_level: None,
             show_log_origin: None,
             module: None,
