@@ -12,15 +12,22 @@
 //
 // Slot format: 8-byte little-endian length, followed by the real file's
 // bytes, followed by zero padding out to the slot's fixed capacity.
+//
+// vmlinux goes in packed (vmlinux_pack.rs - loadable segments only, ~39%
+// smaller), not as the raw file. joos-fire-patch packs the same way.
 
 use std::path::{Path, PathBuf};
 
-// Defaults if JOOS_VMLINUX_MAX/JOOS_INITRD_MAX aren't set - current usage is
-// ~15.65MB/~6.2MB, so these have plenty of headroom out of the box. The
+#[path = "vmlinux_pack.rs"]
+mod vmlinux_pack;
+
+// Default if JOOS_INITRD_MAX isn't set. JOOS_VMLINUX_MAX defaults to the
+// packed vmlinux size rounded up to the next whole MiB instead (the Makefile
+// can't compute that one itself - it only sees the unpacked file). The
 // resolved values (default or overridden) get passed to main.rs via
 // cargo:rustc-env below, so build.rs's padding and main.rs's array sizes
 // always agree - no hardcoded constant to keep in sync by hand anymore.
-const DEFAULT_VMLINUX_MAX: usize = 24 * 1024 * 1024;
+const MIB: usize = 1024 * 1024;
 const DEFAULT_INITRD_MAX: usize = 12 * 1024 * 1024;
 const CONFIG_MAX: usize = 64 * 1024;
 
@@ -76,13 +83,16 @@ fn main() {
     let initrd = resolve("JOOS_INITRD", "initrd.cpio");
     let config_src = resolve("JOOS_CONFIG", "fire_mem.json");
 
-    let vmlinux_max = resolve_size("JOOS_VMLINUX_MAX", DEFAULT_VMLINUX_MAX);
+    let vmlinux_bytes =
+        std::fs::read(&vmlinux).unwrap_or_else(|e| panic!("cannot read {vmlinux:?}: {e}"));
+    let vmlinux_bytes = vmlinux_pack::pack_vmlinux(&vmlinux_bytes)
+        .unwrap_or_else(|e| panic!("cannot pack {vmlinux:?}: {e}"));
+
+    let vmlinux_max = resolve_size("JOOS_VMLINUX_MAX", (vmlinux_bytes.len() / MIB + 1) * MIB);
     let initrd_max = resolve_size("JOOS_INITRD_MAX", DEFAULT_INITRD_MAX);
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
-    let vmlinux_bytes =
-        std::fs::read(&vmlinux).unwrap_or_else(|e| panic!("cannot read {vmlinux:?}: {e}"));
     let vmlinux_slot = Path::new(&out_dir).join("vmlinux.slot");
     write_slot(&vmlinux_slot, &vmlinux_bytes, vmlinux_max);
     println!("cargo:rustc-env=JOOS_VMLINUX_SLOT_PATH={}", vmlinux_slot.display());
@@ -114,6 +124,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", vmlinux.display());
     println!("cargo:rerun-if-changed={}", initrd.display());
     println!("cargo:rerun-if-changed={}", config_src.display());
+    println!("cargo:rerun-if-changed=vmlinux_pack.rs");
     println!("cargo:rerun-if-env-changed=JOOS_VMLINUX");
     println!("cargo:rerun-if-env-changed=JOOS_INITRD");
     println!("cargo:rerun-if-env-changed=JOOS_CONFIG");

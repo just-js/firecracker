@@ -12,11 +12,18 @@
 //
 // Scoped deliberately to exactly two sections, matching this project's
 // current needs - not a general objcopy replacement.
+//
+// vmlinux is packed first with the exact same code joos-fire's build.rs
+// uses (shared via #[path]), so a hot patch writes the same slot bytes a
+// full build would.
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs::OpenOptions;
+use std::io::{Seek, SeekFrom, Write};
 
 use object::{Object, ObjectSection};
+
+#[path = "../../joos-fire/vmlinux_pack.rs"]
+mod vmlinux_pack;
 
 const SECTIONS: [(&str, &str); 2] = [(".joos_vmlinux", "vmlinux"), (".joos_initrd", "initrd")];
 
@@ -49,12 +56,13 @@ fn main() {
         });
         let capacity = size - 8; // slot format: 8-byte LE length prefix + data + padding
 
-        let mut source = File::open(source_path)
-            .unwrap_or_else(|e| fail(&format!("cannot open {source_path}: {e}")));
-        let source_len = source
-            .metadata()
-            .unwrap_or_else(|e| fail(&format!("cannot stat {source_path}: {e}")))
-            .len();
+        let mut source = std::fs::read(source_path)
+            .unwrap_or_else(|e| fail(&format!("cannot read {source_path}: {e}")));
+        if *label == "vmlinux" {
+            source = vmlinux_pack::pack_vmlinux(&source)
+                .unwrap_or_else(|e| fail(&format!("cannot pack {source_path}: {e}")));
+        }
+        let source_len = source.len() as u64;
         if source_len > capacity {
             fail(&format!(
                 "{source_path}: {source_len} bytes exceeds the {label} slot's capacity of {capacity} bytes - rebuild with `make {label}=... build/fire2` (bigger JOOS_{}_MAX) instead",
@@ -64,9 +72,7 @@ fn main() {
 
         let mut buf = Vec::with_capacity(size as usize);
         buf.extend_from_slice(&source_len.to_le_bytes());
-        source
-            .read_to_end(&mut buf)
-            .unwrap_or_else(|e| fail(&format!("cannot read {source_path}: {e}")));
+        buf.extend_from_slice(&source);
         buf.resize(size as usize, 0);
 
         out.seek(SeekFrom::Start(offset))
