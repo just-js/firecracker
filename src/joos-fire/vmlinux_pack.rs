@@ -11,6 +11,9 @@
 // each PT_LOAD's p_offset (plus the PT_NOTE, for the PVH entry point) - so
 // rewriting p_offset is all it takes. Guest memory ends up byte-identical.
 //
+// Also holds the optional lz4 slot formats for vmlinux and initrd
+// (pack_vmlinux_lz4/pack_initrd_lz4 below), decoded by vmm at boot.
+//
 // Shared by joos-fire's build.rs and joos-fire-patch (both pull this file in
 // via #[path]) so full builds and hot patches always produce the exact same
 // slot contents. Deterministic and idempotent: packing an already-packed
@@ -187,4 +190,36 @@ pub fn pack_vmlinux_lz4(
         out.extend_from_slice(&compressed);
     }
     Ok(out)
+}
+
+/// Magic prefix of the chunked lz4 initrd format below. Must match
+/// `INITRD_LZ4_MAGIC` in vmm's initrd.rs, which decodes it.
+pub const INITRD_LZ4_MAGIC: [u8; 8] = *b"JOOSLZI\x01";
+
+/// Uncompressed size of each independently-compressed initrd chunk. lz4's
+/// window is only 64KiB so chunking costs next to nothing in ratio, and it
+/// leaves room to decode chunks in parallel if the rootfs ever gets big.
+pub const INITRD_LZ4_CHUNK: usize = 4 * 1024 * 1024;
+
+/// lz4-compresses an initrd (any blob, really) so joos-fire can decompress
+/// it straight into guest memory at its load address. `compress` is an lz4
+/// block compressor, as for pack_vmlinux_lz4(). Layout, all integers
+/// little-endian u64:
+///
+///   INITRD_LZ4_MAGIC
+///   size                - total uncompressed size
+///   nchunk              - then per chunk, in order:
+///   raw_len, clen, clen bytes of lz4 block data
+pub fn pack_initrd_lz4(initrd: &[u8], compress: &dyn Fn(&[u8]) -> Vec<u8>) -> Vec<u8> {
+    let chunks: Vec<&[u8]> = initrd.chunks(INITRD_LZ4_CHUNK).collect();
+    let mut out = INITRD_LZ4_MAGIC.to_vec();
+    out.extend_from_slice(&(initrd.len() as u64).to_le_bytes());
+    out.extend_from_slice(&(chunks.len() as u64).to_le_bytes());
+    for chunk in chunks {
+        let compressed = compress(chunk);
+        out.extend_from_slice(&(chunk.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+        out.extend_from_slice(&compressed);
+    }
+    out
 }

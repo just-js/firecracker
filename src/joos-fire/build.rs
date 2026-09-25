@@ -16,21 +16,21 @@
 // vmlinux goes in packed (vmlinux_pack.rs - loadable segments only, ~39%
 // smaller), not as the raw file. joos-fire-patch packs the same way.
 // JOOS_VMLINUX_LZ4=1 additionally lz4-compresses each segment (another ~70%
-// smaller, costs a ~2-3ms decode at boot) - see doc/VMLINUX_PACK.md.
+// smaller, costs a ~2-3ms decode at boot), and JOOS_INITRD_LZ4=1 does the
+// same for initrd.cpio - see doc/VMLINUX_PACK.md.
 
 use std::path::{Path, PathBuf};
 
 #[path = "vmlinux_pack.rs"]
 mod vmlinux_pack;
 
-// Default if JOOS_INITRD_MAX isn't set. JOOS_VMLINUX_MAX defaults to the
-// packed vmlinux size rounded up to the next whole MiB instead (the Makefile
-// can't compute that one itself - it only sees the unpacked file). The
+// JOOS_VMLINUX_MAX/JOOS_INITRD_MAX default to the size of what actually goes
+// in the slot (packed and/or lz4) rounded up to the next whole MiB - the
+// Makefile can't compute that itself, it only sees the raw files. The
 // resolved values (default or overridden) get passed to main.rs via
 // cargo:rustc-env below, so build.rs's padding and main.rs's array sizes
 // always agree - no hardcoded constant to keep in sync by hand anymore.
 const MIB: usize = 1024 * 1024;
-const DEFAULT_INITRD_MAX: usize = 12 * 1024 * 1024;
 const CONFIG_MAX: usize = 64 * 1024;
 
 fn resolve(env_var: &str, default_rel: &str) -> PathBuf {
@@ -78,6 +78,12 @@ fn write_slot(dest: &Path, content: &[u8], capacity: usize) {
     std::fs::write(dest, out).unwrap_or_else(|e| panic!("cannot write {dest:?}: {e}"));
 }
 
+/// True if `var` is set to exactly "1" (so `JOOS_X_LZ4=0` or unset is off).
+fn env_flag(var: &str) -> bool {
+    println!("cargo:rerun-if-env-changed={var}");
+    std::env::var(var).is_ok_and(|v| v == "1")
+}
+
 fn lz4_compress(data: &[u8]) -> Vec<u8> {
     let mode = lz4::block::CompressionMode::HIGHCOMPRESSION(vmlinux_pack::LZ4_LEVEL);
     lz4::block::compress(data, Some(mode), false).expect("lz4 compression failed")
@@ -93,8 +99,7 @@ fn main() {
     let vmlinux_bytes =
         std::fs::read(&vmlinux).unwrap_or_else(|e| panic!("cannot read {vmlinux:?}: {e}"));
     let raw_len = vmlinux_bytes.len();
-    println!("cargo:rerun-if-env-changed=JOOS_VMLINUX_LZ4");
-    let lz4 = std::env::var("JOOS_VMLINUX_LZ4").is_ok_and(|v| v == "1");
+    let lz4 = env_flag("JOOS_VMLINUX_LZ4");
     let vmlinux_bytes = if lz4 {
         vmlinux_pack::pack_vmlinux_lz4(&vmlinux_bytes, &lz4_compress)
     } else {
@@ -108,7 +113,6 @@ fn main() {
     );
 
     let vmlinux_max = resolve_size("JOOS_VMLINUX_MAX", (vmlinux_bytes.len() / MIB + 1) * MIB);
-    let initrd_max = resolve_size("JOOS_INITRD_MAX", DEFAULT_INITRD_MAX);
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
@@ -118,6 +122,19 @@ fn main() {
 
     let initrd_bytes =
         std::fs::read(&initrd).unwrap_or_else(|e| panic!("cannot read {initrd:?}: {e}"));
+    let raw_len = initrd_bytes.len();
+    let lz4 = env_flag("JOOS_INITRD_LZ4");
+    let initrd_bytes = if lz4 {
+        vmlinux_pack::pack_initrd_lz4(&initrd_bytes, &lz4_compress)
+    } else {
+        initrd_bytes
+    };
+    println!(
+        "cargo:warning=initrd: {raw_len} bytes raw -> {} bytes {}",
+        initrd_bytes.len(),
+        if lz4 { "lz4" } else { "uncompressed" }
+    );
+    let initrd_max = resolve_size("JOOS_INITRD_MAX", (initrd_bytes.len() / MIB + 1) * MIB);
     let initrd_slot = Path::new(&out_dir).join("initrd.slot");
     write_slot(&initrd_slot, &initrd_bytes, initrd_max);
     println!("cargo:rustc-env=JOOS_INITRD_SLOT_PATH={}", initrd_slot.display());

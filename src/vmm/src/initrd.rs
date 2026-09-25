@@ -4,6 +4,7 @@
 use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 
+use vm_memory::bitmap::Bitmap;
 use vm_memory::{Bytes, GuestAddress, GuestMemory, ReadVolatile, VolatileMemoryError};
 
 use crate::arch::initrd_load_addr;
@@ -24,6 +25,29 @@ pub enum InitrdError {
     CloneFd(std::io::Error),
     /// Cannot load initrd due to an invalid image: {0}
     Read(VolatileMemoryError),
+    /// Cannot load lz4-compressed initrd: {0}
+    Lz4(String),
+}
+
+/// Magic prefix of joos-fire's chunked lz4 initrd format. Must match
+/// `INITRD_LZ4_MAGIC` in src/joos-fire/vmlinux_pack.rs, whose
+/// pack_initrd_lz4() documents the layout.
+pub const INITRD_LZ4_MAGIC: [u8; 8] = *b"JOOSLZI\x01";
+
+/// Splits the next `len` bytes off the front of `data`.
+fn take<'a>(data: &mut &'a [u8], len: usize) -> Result<&'a [u8], InitrdError> {
+    if data.len() < len {
+        return Err(InitrdError::Lz4("truncated image".to_string()));
+    }
+    let (head, tail) = data.split_at(len);
+    *data = tail;
+    Ok(head)
+}
+
+fn take_usize(data: &mut &[u8]) -> Result<usize, InitrdError> {
+    Ok(u64_to_usize(u64::from_le_bytes(
+        take(data, 8)?.try_into().unwrap(),
+    )))
 }
 
 /// Type for passing information about the initrd in the guest memory.
@@ -54,7 +78,13 @@ impl InitrdConfig {
     /// memory (e.g. an `include_bytes!`'d initrd.cpio in an embedding binary
     /// like `joos-fire`), instead of a `File` - see `from_file` below for
     /// the file-based equivalent this project's stock boot path still uses.
+    ///
+    /// Data starting with `INITRD_LZ4_MAGIC` is decompressed straight into
+    /// guest memory at the load address instead - see `from_lz4_bytes`.
     pub fn from_bytes(vm_memory: &GuestMemoryMmap, data: &[u8]) -> Result<Self, InitrdError> {
+        if data.starts_with(&INITRD_LZ4_MAGIC) {
+            return Self::from_lz4_bytes(vm_memory, data);
+        }
         let size = data.len();
         let Some(address) = initrd_load_addr(vm_memory, size) else {
             return Err(InitrdError::Address);
@@ -62,6 +92,59 @@ impl InitrdConfig {
         vm_memory
             .write_slice(data, GuestAddress(address))
             .map_err(|_| InitrdError::Load)?;
+
+        Ok(InitrdConfig {
+            address: GuestAddress(address),
+            size,
+        })
+    }
+
+    /// Decompresses a joos-fire lz4 initrd (`INITRD_LZ4_MAGIC`) chunk by chunk
+    /// directly into guest memory at the same address an uncompressed initrd
+    /// of that size would get - no intermediate buffer, no second copy.
+    fn from_lz4_bytes(vm_memory: &GuestMemoryMmap, data: &[u8]) -> Result<Self, InitrdError> {
+        let err = |msg: String| InitrdError::Lz4(msg);
+        let mut rest = &data[INITRD_LZ4_MAGIC.len()..];
+        let size = take_usize(&mut rest)?;
+        let nchunk = take_usize(&mut rest)?;
+        let Some(address) = initrd_load_addr(vm_memory, size) else {
+            return Err(InitrdError::Address);
+        };
+        let dest = vm_memory
+            .get_slice(GuestAddress(address), size)
+            .map_err(|_| InitrdError::Load)?;
+        let guard = dest.ptr_guard_mut();
+        // SAFETY: get_slice() checked that [address, address + size) is backed
+        // by a single guest memory mapping, which stays mapped while `guard`
+        // lives. No vCPU has run yet, so nothing else is accessing this memory.
+        let buf = unsafe { std::slice::from_raw_parts_mut(guard.as_ptr(), size) };
+
+        let mut pos = 0;
+        for _ in 0..nchunk {
+            let raw_len = take_usize(&mut rest)?;
+            let clen = take_usize(&mut rest)?;
+            let chunk = take(&mut rest, clen)?;
+            let end = pos + raw_len;
+            if end > size {
+                return Err(err(format!("chunks exceed declared size {size}")));
+            }
+            let raw_len_i32 =
+                i32::try_from(raw_len).map_err(|_| err(format!("chunk too big: {raw_len}")))?;
+            let written =
+                lz4::block::decompress_to_buffer(chunk, Some(raw_len_i32), &mut buf[pos..end])
+                    .map_err(|e| err(format!("chunk at {pos}: {e}")))?;
+            if written != raw_len {
+                return Err(err(format!(
+                    "chunk at {pos}: decompressed {written} bytes, expected {raw_len}"
+                )));
+            }
+            pos = end;
+        }
+        if pos != size {
+            return Err(err(format!("decompressed {pos} bytes, expected {size}")));
+        }
+        // What write_slice() would have done, for dirty-page tracking (snapshots).
+        dest.bitmap().mark_dirty(0, size);
 
         Ok(InitrdConfig {
             address: GuestAddress(address),
