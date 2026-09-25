@@ -47,7 +47,8 @@ use crate::logger::debug;
 use crate::utils::{align_down, u64_to_usize, usize_to_u64};
 use crate::vmm_config::machine_config::MachineConfig;
 use crate::vstate::memory::{
-    Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, GuestRegionType,
+    Address, Bitmap, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
+    GuestRegionType,
 };
 use crate::vstate::vcpu::KvmVcpuConfigureError;
 use crate::vstate::vm::KvmVm;
@@ -94,6 +95,8 @@ pub enum ConfigurationError {
     KernelFile,
     /// Cannot load kernel due to invalid memory configuration or invalid kernel image: {0}
     KernelLoader(linux_loader::loader::Error),
+    /// Cannot load lz4-packed kernel image: {0}
+    KernelLz4(String),
     /// Cannot load command line string: {0}
     LoadCommandline(linux_loader::loader::Error),
     /// Failed to create guest config: {0}
@@ -465,6 +468,75 @@ pub fn load_kernel<F: Read + ReadVolatile + Seek>(
         entry_addr: entry_point_addr,
         protocol: boot_prot,
     })
+}
+
+/// Magic prefix of joos-fire's lz4 kernel format. Must match `LZ4_MAGIC` in
+/// src/joos-fire/vmlinux_pack.rs, whose pack_vmlinux_lz4() documents the layout.
+pub const KERNEL_LZ4_MAGIC: [u8; 8] = *b"JOOSLZ4\x01";
+
+fn lz4_take<'a>(
+    image: &'a [u8],
+    pos: &mut usize,
+    len: usize,
+) -> Result<&'a [u8], ConfigurationError> {
+    let bytes = pos
+        .checked_add(len)
+        .and_then(|end| image.get(*pos..end))
+        .ok_or_else(|| ConfigurationError::KernelLz4("truncated image".to_string()))?;
+    *pos += len;
+    Ok(bytes)
+}
+
+fn lz4_take_usize(image: &[u8], pos: &mut usize) -> Result<usize, ConfigurationError> {
+    let bytes = lz4_take(image, pos, 8)?;
+    Ok(u64_to_usize(u64::from_le_bytes(bytes.try_into().unwrap())))
+}
+
+/// Loads a kernel in joos-fire's lz4 format (`KERNEL_LZ4_MAGIC`): the stub ELF
+/// goes through the normal `load_kernel()` for header validation and entry
+/// point/PVH detection (its PT_LOADs have p_filesz 0, so nothing is copied),
+/// then each segment is lz4-decompressed directly into guest memory at its
+/// p_paddr - no intermediate buffer, no second copy.
+pub fn load_kernel_lz4(
+    image: &[u8],
+    guest_memory: &GuestMemoryMmap,
+) -> Result<EntryPoint, ConfigurationError> {
+    let err = |msg: String| ConfigurationError::KernelLz4(msg);
+    if !image.starts_with(&KERNEL_LZ4_MAGIC) {
+        return Err(err("bad magic".to_string()));
+    }
+    let mut pos = KERNEL_LZ4_MAGIC.len();
+    let stub_len = lz4_take_usize(image, &mut pos)?;
+    let stub = lz4_take(image, &mut pos, stub_len)?;
+    let entry_point = load_kernel(&mut std::io::Cursor::new(stub), guest_memory)?;
+
+    let nseg = lz4_take_usize(image, &mut pos)?;
+    for _ in 0..nseg {
+        let paddr = lz4_take_usize(image, &mut pos)?;
+        let filesz = lz4_take_usize(image, &mut pos)?;
+        let clen = lz4_take_usize(image, &mut pos)?;
+        let data = lz4_take(image, &mut pos, clen)?;
+        let size = i32::try_from(filesz).map_err(|_| err(format!("segment too big: {filesz}")))?;
+        let dest = guest_memory
+            .get_slice(GuestAddress(usize_to_u64(paddr)), filesz)
+            .map_err(|e| err(format!("segment at {paddr:#x}: {e}")))?;
+        let guard = dest.ptr_guard_mut();
+        // SAFETY: get_slice() checked that [paddr, paddr + filesz) is backed by
+        // a single guest memory mapping, which stays mapped while `guard` lives.
+        // No vCPU has run yet, so nothing else is accessing this memory.
+        let buf = unsafe { std::slice::from_raw_parts_mut(guard.as_ptr(), filesz) };
+        let written = lz4::block::decompress_to_buffer(data, Some(size), buf)
+            .map_err(|e| err(format!("segment at {paddr:#x}: {e}")))?;
+        if written != filesz {
+            return Err(err(format!(
+                "segment at {paddr:#x}: decompressed {written} bytes, expected {filesz}"
+            )));
+        }
+        // What linux-loader's volatile copy would have done, for dirty-page
+        // tracking (snapshots).
+        dest.bitmap().mark_dirty(0, filesz);
+    }
+    Ok(entry_point)
 }
 
 #[cfg(kani)]

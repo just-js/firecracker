@@ -73,6 +73,24 @@ fn slot_data(slot: &'static [u8]) -> &'static [u8] {
     &slot[8..8 + len]
 }
 
+/// Drops `slot`'s resident pages via MADV_DONTNEED. The slots are
+/// read-only, file-backed, never-written pages of this binary, so this can't
+/// lose data - any later access would just fault them back in from the file.
+/// Only whole pages inside the slot are released (the ends may share a page
+/// with neighbouring data). Best effort: failure only costs RSS.
+fn release_pages(slot: &'static [u8]) {
+    // SAFETY: sysconf has no preconditions.
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096);
+    let start = (slot.as_ptr() as usize).next_multiple_of(page);
+    let end = (slot.as_ptr() as usize + slot.len()) / page * page;
+    if end > start {
+        // SAFETY: [start, end) lies within `slot`, a mapped read-only static
+        // that's never written, so MADV_DONTNEED only drops clean file-backed
+        // pages and the kernel refaults identical contents on any later read.
+        unsafe { libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_DONTNEED) };
+    }
+}
+
 /// Reads the number of currently-free 2M hugetlbfs pages on this host, or
 /// `None` if the sysfs file doesn't exist (no hugetlbfs support/reservation
 /// at all) or doesn't parse - both treated as "don't use huge pages" by the
@@ -187,6 +205,12 @@ fn main() {
         &seccomp_filters,
     )
     .expect("failed to build/boot microVM");
+
+    // vmlinux/initrd are in guest memory now and nothing reads the slots
+    // again - drop their pages from our RSS (~8MB packed+lz4, ~16MB packed).
+    // After boot, so it's off the guest's critical path.
+    release_pages(&VMLINUX_SLOT);
+    release_pages(&INITRD_SLOT);
 
     // Same event loop firecracker's own main.rs runs post-construction -
     // this is what actually keeps devices/vsock functioning, not just the

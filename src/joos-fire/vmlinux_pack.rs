@@ -68,7 +68,11 @@ pub fn pack_vmlinux(vmlinux: &[u8]) -> Result<Vec<u8>, String> {
         let p_type = u32_at(ph, 0);
         let offset = to_usize(u64_at(ph, 8), "p_offset")?;
         let filesz = to_usize(u64_at(ph, 32), "p_filesz")?;
-        if filesz > 0 && offset.checked_add(filesz).is_none_or(|end| end > vmlinux.len()) {
+        if filesz > 0
+            && offset
+                .checked_add(filesz)
+                .is_none_or(|end| end > vmlinux.len())
+        {
             return Err(format!("program header {i} runs past end of file"));
         }
         segs.push((p_type, offset, filesz));
@@ -100,10 +104,13 @@ pub fn pack_vmlinux(vmlinux: &[u8]) -> Result<Vec<u8>, String> {
         if p_type == PT_LOAD || filesz == 0 {
             continue;
         }
-        let container = segs.iter().zip(&new_offsets).find_map(|(&(t, o, s), &new)| {
-            (t == PT_LOAD && s > 0 && offset >= o && offset + filesz <= o + s)
-                .then(|| new.unwrap() + (offset - o))
-        });
+        let container = segs
+            .iter()
+            .zip(&new_offsets)
+            .find_map(|(&(t, o, s), &new)| {
+                (t == PT_LOAD && s > 0 && offset >= o && offset + filesz <= o + s)
+                    .then(|| new.unwrap() + (offset - o))
+            });
         new_offsets[i] = Some(container.unwrap_or_else(|| place(&mut out, offset, filesz)));
     }
 
@@ -112,6 +119,72 @@ pub fn pack_vmlinux(vmlinux: &[u8]) -> Result<Vec<u8>, String> {
         let src = phoff + i * PHDR_SIZE;
         out[ph..ph + PHDR_SIZE].copy_from_slice(&vmlinux[src..src + PHDR_SIZE]);
         out[ph + 8..ph + 16].copy_from_slice(&(new.unwrap_or(0) as u64).to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// Magic prefix of the lz4 slot format below. Must match
+/// `KERNEL_LZ4_MAGIC` in vmm's arch/x86_64/mod.rs, which decodes it.
+pub const LZ4_MAGIC: [u8; 8] = *b"JOOSLZ4\x01";
+
+/// lz4 HC level used by both build.rs and joos-fire-patch, so hot patches
+/// produce the same bytes as full builds. 9 gets ~the same ratio as the max
+/// (12) in a third of the time (0.26s vs 0.81s on the current kernel).
+pub const LZ4_LEVEL: i32 = 9;
+
+/// Packs `vmlinux` as above, then lz4-compresses each PT_LOAD separately so
+/// joos-fire can decompress it straight into guest memory at p_paddr, with
+/// no intermediate buffer and no second copy. `compress` is an lz4 *block* compressor
+/// (the caller supplies it, so this file stays dependency-free). Layout, all
+/// integers little-endian u64:
+///
+///   LZ4_MAGIC
+///   stub_len, stub      - ELF header + program headers with every PT_LOAD's
+///                         p_filesz zeroed (linux-loader skips those), plus
+///                         any non-PT_LOAD data (the PVH PT_NOTE). Fed to the
+///                         normal loader for entry point/PVH detection.
+///   nseg                - then per PT_LOAD, in program header order:
+///   paddr, filesz, clen, clen bytes of lz4 block data
+pub fn pack_vmlinux_lz4(
+    vmlinux: &[u8],
+    compress: &dyn Fn(&[u8]) -> Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    // Normalise (and bounds-check) first, so offsets below are trusted.
+    let packed = pack_vmlinux(vmlinux)?;
+    let phnum = usize::from(u16_at(&packed, 56));
+    let phdr = |i: usize| &packed[EHDR_SIZE + i * PHDR_SIZE..EHDR_SIZE + (i + 1) * PHDR_SIZE];
+
+    let mut stub = packed[..EHDR_SIZE + phnum * PHDR_SIZE].to_vec();
+    let mut segs = Vec::new();
+    for i in 0..phnum {
+        let ph = phdr(i);
+        let offset = to_usize(u64_at(ph, 8), "p_offset")?;
+        let filesz = to_usize(u64_at(ph, 32), "p_filesz")?;
+        let at = EHDR_SIZE + i * PHDR_SIZE;
+        if u32_at(ph, 0) == PT_LOAD {
+            stub[at + 8..at + 16].fill(0); // p_offset
+            stub[at + 32..at + 40].fill(0); // p_filesz
+            if filesz > 0 {
+                segs.push((u64_at(ph, 24), &packed[offset..offset + filesz]));
+            }
+        } else if filesz > 0 {
+            stub.resize(stub.len().next_multiple_of(DATA_ALIGN), 0);
+            let new_offset = stub.len() as u64;
+            stub.extend_from_slice(&packed[offset..offset + filesz]);
+            stub[at + 8..at + 16].copy_from_slice(&new_offset.to_le_bytes());
+        }
+    }
+
+    let mut out = LZ4_MAGIC.to_vec();
+    out.extend_from_slice(&(stub.len() as u64).to_le_bytes());
+    out.extend_from_slice(&stub);
+    out.extend_from_slice(&(segs.len() as u64).to_le_bytes());
+    for (paddr, data) in segs {
+        let compressed = compress(data);
+        out.extend_from_slice(&paddr.to_le_bytes());
+        out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+        out.extend_from_slice(&compressed);
     }
     Ok(out)
 }

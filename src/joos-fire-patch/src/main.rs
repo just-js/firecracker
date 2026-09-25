@@ -15,7 +15,8 @@
 //
 // vmlinux is packed first with the exact same code joos-fire's build.rs
 // uses (shared via #[path]), so a hot patch writes the same slot bytes a
-// full build would.
+// full build would. Packed or packed+lz4 follows whatever the target was
+// built with (JOOS_VMLINUX_LZ4), detected from the slot's current contents.
 
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
@@ -58,9 +59,18 @@ fn main() {
 
         let mut source = std::fs::read(source_path)
             .unwrap_or_else(|e| fail(&format!("cannot read {source_path}: {e}")));
+        let mut format = "";
         if *label == "vmlinux" {
-            source = vmlinux_pack::pack_vmlinux(&source)
-                .unwrap_or_else(|e| fail(&format!("cannot pack {source_path}: {e}")));
+            let slot_start = usize::try_from(offset).unwrap() + 8;
+            let current = &fire2_bytes[slot_start..slot_start + vmlinux_pack::LZ4_MAGIC.len()];
+            let lz4 = current == vmlinux_pack::LZ4_MAGIC;
+            source = if lz4 {
+                vmlinux_pack::pack_vmlinux_lz4(&source, &lz4_compress)
+            } else {
+                vmlinux_pack::pack_vmlinux(&source)
+            }
+            .unwrap_or_else(|e| fail(&format!("cannot pack {source_path}: {e}")));
+            format = if lz4 { " (packed+lz4)" } else { " (packed)" };
         }
         let source_len = source.len() as u64;
         if source_len > capacity {
@@ -80,8 +90,16 @@ fn main() {
         out.write_all(&buf)
             .unwrap_or_else(|e| fail(&format!("cannot write {fire2_path}: {e}")));
 
-        println!("{label}: patched {source_len} bytes into {section_name} (capacity {capacity})");
+        println!(
+            "{label}: patched {source_len} bytes{format} into {section_name} (capacity {capacity})"
+        );
     }
+}
+
+fn lz4_compress(data: &[u8]) -> Vec<u8> {
+    let mode = lz4::block::CompressionMode::HIGHCOMPRESSION(vmlinux_pack::LZ4_LEVEL);
+    lz4::block::compress(data, Some(mode), false)
+        .unwrap_or_else(|e| fail(&format!("lz4 compression failed: {e}")))
 }
 
 fn fail(msg: &str) -> ! {

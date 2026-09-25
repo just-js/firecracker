@@ -209,6 +209,10 @@ pub fn build_microvm_for_boot(
     // directly from those in-process bytes instead of boot_config's File -
     // see the field docs on VmResources for why this exists.
     let entry_point = match vm_resources.kernel_bytes {
+        #[cfg(target_arch = "x86_64")]
+        Some(bytes) if bytes.starts_with(&crate::arch::KERNEL_LZ4_MAGIC) => {
+            crate::arch::load_kernel_lz4(bytes, guest_memory)?
+        }
         Some(bytes) => load_kernel(&mut io::Cursor::new(bytes), guest_memory)?,
         None => {
             let mut kernel_file = boot_config

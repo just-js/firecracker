@@ -15,6 +15,8 @@
 //
 // vmlinux goes in packed (vmlinux_pack.rs - loadable segments only, ~39%
 // smaller), not as the raw file. joos-fire-patch packs the same way.
+// JOOS_VMLINUX_LZ4=1 additionally lz4-compresses each segment (another ~70%
+// smaller, costs a ~2-3ms decode at boot) - see doc/VMLINUX_PACK.md.
 
 use std::path::{Path, PathBuf};
 
@@ -76,6 +78,11 @@ fn write_slot(dest: &Path, content: &[u8], capacity: usize) {
     std::fs::write(dest, out).unwrap_or_else(|e| panic!("cannot write {dest:?}: {e}"));
 }
 
+fn lz4_compress(data: &[u8]) -> Vec<u8> {
+    let mode = lz4::block::CompressionMode::HIGHCOMPRESSION(vmlinux_pack::LZ4_LEVEL);
+    lz4::block::compress(data, Some(mode), false).expect("lz4 compression failed")
+}
+
 fn main() {
     // Bare filenames by default - real usage always sets these explicitly
     // (see the Makefile), pointing at the joos project's build/ directory.
@@ -85,8 +92,20 @@ fn main() {
 
     let vmlinux_bytes =
         std::fs::read(&vmlinux).unwrap_or_else(|e| panic!("cannot read {vmlinux:?}: {e}"));
-    let vmlinux_bytes = vmlinux_pack::pack_vmlinux(&vmlinux_bytes)
-        .unwrap_or_else(|e| panic!("cannot pack {vmlinux:?}: {e}"));
+    let raw_len = vmlinux_bytes.len();
+    println!("cargo:rerun-if-env-changed=JOOS_VMLINUX_LZ4");
+    let lz4 = std::env::var("JOOS_VMLINUX_LZ4").is_ok_and(|v| v == "1");
+    let vmlinux_bytes = if lz4 {
+        vmlinux_pack::pack_vmlinux_lz4(&vmlinux_bytes, &lz4_compress)
+    } else {
+        vmlinux_pack::pack_vmlinux(&vmlinux_bytes)
+    }
+    .unwrap_or_else(|e| panic!("cannot pack {vmlinux:?}: {e}"));
+    println!(
+        "cargo:warning=vmlinux: {raw_len} bytes raw -> {} bytes {}",
+        vmlinux_bytes.len(),
+        if lz4 { "packed+lz4" } else { "packed" }
+    );
 
     let vmlinux_max = resolve_size("JOOS_VMLINUX_MAX", (vmlinux_bytes.len() / MIB + 1) * MIB);
     let initrd_max = resolve_size("JOOS_INITRD_MAX", DEFAULT_INITRD_MAX);
