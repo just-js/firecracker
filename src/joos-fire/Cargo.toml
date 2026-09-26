@@ -8,9 +8,5 @@ build = "build.rs"
 libc = "0.2.186"
 vmm = { path = "../vmm" }
 
-[build-dependencies]
-lz4 = "1.28.1"
-serde_json = "1.0"
-
 [lints]
 workspace = true

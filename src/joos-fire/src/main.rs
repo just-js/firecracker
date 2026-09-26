@@ -1,6 +1,6 @@
-// A custom firecracker launcher that embeds vmlinux/initrd.cpio/config
-// directly (see build.rs) and calls vmm's VMM-construction API in-process,
-// instead of this project's usual wrapper (memfd_create + write + fexecve
+// A custom firecracker launcher that boots the vmlinux/initrd.cpio/config
+// appended to its own binary (see payload()) and calls vmm's
+// VMM-construction API in-process, instead of this project's usual wrapper (memfd_create + write + fexecve
 // into a stock firecracker binary). Eliminates that wrapper's ~10-11ms of
 // memfd writes entirely - see FIRECRACKER.md and BOOT_PROFILE.md in the
 // parent joos project for the full reasoning and measurements.
@@ -20,73 +20,94 @@ use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
 use vmm::vmm_config::machine_config::HugePageConfig;
 use vmm::{EventManager, FcExitCode};
 
-/// Parses an ASCII-digit-only compile-time string into a `usize`, for
-/// turning `env!("JOOS_VMLINUX_MAX")` (build.rs's resolved slot capacity,
-/// see resolve_size() there) into an array-size constant. `str::parse`
-/// isn't const-evaluable, hence the manual byte-by-byte parse.
-const fn parse_usize(s: &str) -> usize {
-    let bytes = s.as_bytes();
-    let mut result: usize = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        assert!(b.is_ascii_digit(), "JOOS_*_MAX must be a plain integer (bytes)");
-        result = result * 10 + (b - b'0') as usize;
-        i += 1;
+// The kernel, initrd and config aren't built into this binary: joos's
+// tools/assemble.js appends them to a copy of it, as one extra read-only
+// PT_LOAD segment made from the spare program header build.rs reserves.
+// The kernel maps it at exec like any other segment, so nothing here opens
+// a file. Payload layout, all integers little-endian:
+//
+//   "JOOSPAY1", u32 count, u32 0
+//   count x (u32 kind, u32 0, u64 offset from payload start, u64 len)
+//   blobs
+const PAYLOAD_MAGIC: &[u8; 8] = b"JOOSPAY1";
+const KIND_VMLINUX: u32 = 1;
+const KIND_INITRD: u32 = 2;
+const KIND_CONFIG: u32 = 3;
+
+unsafe extern "C" {
+    // Linker-defined: the ELF header, i.e. this binary's load address.
+    static __ehdr_start: u8;
+}
+
+/// Returns the payload segment: the PT_LOAD whose first bytes are
+/// PAYLOAD_MAGIC. Panics if there is none (a bare, unassembled joos-fire).
+fn payload() -> &'static [u8] {
+    // SAFETY: getauxval has no preconditions; AT_PHDR/AT_PHNUM describe this
+    // executable's program headers, which the kernel always maps.
+    let (phdr, phnum) = unsafe {
+        (
+            libc::getauxval(libc::AT_PHDR) as *const libc::Elf64_Phdr,
+            libc::getauxval(libc::AT_PHNUM) as usize,
+        )
+    };
+    // SAFETY: see above.
+    let phdrs = unsafe { std::slice::from_raw_parts(phdr, phnum) };
+    let base = (&raw const __ehdr_start) as usize;
+    for ph in phdrs {
+        if ph.p_type != libc::PT_LOAD || ph.p_memsz < 16 {
+            continue;
+        }
+        // SAFETY: a PT_LOAD's [p_vaddr, p_vaddr + p_memsz) is mapped for the
+        // life of the process, and nothing in this program writes to it.
+        let segment = unsafe {
+            std::slice::from_raw_parts(
+                (base + ph.p_vaddr as usize) as *const u8,
+                ph.p_memsz as usize,
+            )
+        };
+        if segment.starts_with(PAYLOAD_MAGIC) {
+            return segment;
+        }
     }
-    result
+    panic!("no payload segment - assemble this binary with joos's tools/assemble.js");
 }
 
-// Configurable at build time, e.g. `JOOS_VMLINUX_MAX=33554432 cargo build
-// ...` (see the Makefile) - build.rs resolves these (with defaults) and
-// re-exports them via cargo:rustc-env, so the value read here always
-// matches what build.rs padded the slot files to. CONFIG_MAX isn't
-// build-time-configurable (config is tiny, unlikely to need it) but could
-// be given the same treatment if that changes.
-const VMLINUX_MAX: usize = parse_usize(env!("JOOS_VMLINUX_MAX"));
-const INITRD_MAX: usize = parse_usize(env!("JOOS_INITRD_MAX"));
-const CONFIG_MAX: usize = 64 * 1024;
-
-// Each slot lives in its own dedicated ELF section (rather than sharing
-// .rodata with everything else) so `objcopy --update-section` can overwrite
-// just that section's bytes directly in the already-built binary when only
-// the asset changes - no cargo/rustc/mold at all. See build.rs and
-// tools/patch_fire2.sh. Slot format: 8-byte LE length prefix + real bytes +
-// zero padding out to the MAX capacity above (falls back to a real rebuild
-// if an asset ever exceeds its capacity - build.rs panics in that case).
-#[unsafe(no_mangle)]
-#[unsafe(link_section = ".joos_vmlinux")]
-static VMLINUX_SLOT: [u8; 8 + VMLINUX_MAX] = *include_bytes!(env!("JOOS_VMLINUX_SLOT_PATH"));
-
-#[unsafe(no_mangle)]
-#[unsafe(link_section = ".joos_initrd")]
-static INITRD_SLOT: [u8; 8 + INITRD_MAX] = *include_bytes!(env!("JOOS_INITRD_SLOT_PATH"));
-
-#[unsafe(no_mangle)]
-#[unsafe(link_section = ".joos_config")]
-static CONFIG_SLOT: [u8; 8 + CONFIG_MAX] = *include_bytes!(env!("JOOS_CONFIG_SLOT_PATH"));
-
-/// Extracts the real (unpadded) bytes out of a slot: an 8-byte LE length
-/// prefix followed by that many real bytes, then zero padding.
-fn slot_data(slot: &'static [u8]) -> &'static [u8] {
-    let len = u64::from_le_bytes(slot[0..8].try_into().unwrap()) as usize;
-    &slot[8..8 + len]
+fn u32_at(b: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
 }
 
-/// Drops `slot`'s resident pages via MADV_DONTNEED. The slots are
-/// read-only, file-backed, never-written pages of this binary, so this can't
-/// lose data - any later access would just fault them back in from the file.
-/// Only whole pages inside the slot are released (the ends may share a page
-/// with neighbouring data). Best effort: failure only costs RSS.
-fn release_pages(slot: &'static [u8]) {
+fn u64_at(b: &[u8], off: usize) -> usize {
+    usize::try_from(u64::from_le_bytes(b[off..off + 8].try_into().unwrap())).unwrap()
+}
+
+/// Returns the blob of `kind` from `payload`. Panics if it's missing.
+fn blob(payload: &'static [u8], kind: u32) -> &'static [u8] {
+    let count = u32_at(payload, 8) as usize;
+    for i in 0..count {
+        let entry = 16 + i * 24;
+        if u32_at(payload, entry) == kind {
+            let (offset, len) = (u64_at(payload, entry + 8), u64_at(payload, entry + 16));
+            return &payload[offset..offset + len];
+        }
+    }
+    panic!("payload has no blob of kind {kind}");
+}
+
+/// Drops `payload`'s resident pages via MADV_DONTNEED. It's read-only,
+/// file-backed, never-written pages of this binary, so this can't lose data -
+/// any later access (the slices stay valid) just faults them back in from the
+/// file. The segment is page-aligned, so its first page is always released.
+/// Best effort: failure only costs RSS.
+fn release_pages(payload: &'static [u8]) {
     // SAFETY: sysconf has no preconditions.
     let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096);
-    let start = (slot.as_ptr() as usize).next_multiple_of(page);
-    let end = (slot.as_ptr() as usize + slot.len()) / page * page;
+    let start = (payload.as_ptr() as usize).next_multiple_of(page);
+    let end = (payload.as_ptr() as usize + payload.len()) / page * page;
     if end > start {
-        // SAFETY: [start, end) lies within `slot`, a mapped read-only static
-        // that's never written, so MADV_DONTNEED only drops clean file-backed
-        // pages and the kernel refaults identical contents on any later read.
+        // SAFETY: [start, end) lies within `payload`, a mapped read-only
+        // segment that's never written, so MADV_DONTNEED only drops clean
+        // file-backed pages and the kernel refaults identical contents on any
+        // later read.
         unsafe { libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_DONTNEED) };
     }
 }
@@ -132,17 +153,19 @@ fn main() {
 
     let mut event_manager = EventManager::new().expect("failed to create EventManager");
 
-    let config_json =
-        std::str::from_utf8(slot_data(&CONFIG_SLOT)).expect("embedded config JSON is not UTF-8");
+    let payload = payload();
+    let config_json = std::str::from_utf8(blob(payload, KIND_CONFIG))
+        .expect("embedded config JSON is not UTF-8");
     let mut vm_resources = VmResources::from_json(config_json, &instance_info, 0, None)
         .expect("failed to parse embedded config JSON");
     // Matches --boot-timer on the stock firecracker launch this replaces.
     vm_resources.boot_timer = true;
     // The whole point: load straight from the embedded bytes above, instead
     // of boot_source.builder's File (which the embedded config's patched
-    // boot-source section deliberately points at /dev/null - see build.rs).
-    vm_resources.kernel_bytes = Some(slot_data(&VMLINUX_SLOT));
-    vm_resources.initrd_bytes = Some(slot_data(&INITRD_SLOT));
+    // boot-source section deliberately points at /dev/null - see
+    // tools/assemble.js's pack_config()).
+    vm_resources.kernel_bytes = Some(blob(payload, KIND_VMLINUX));
+    vm_resources.initrd_bytes = Some(blob(payload, KIND_INITRD));
 
     // Hugetlbfs-backed anonymous guest memory - see joos/INIT.md's "Plan:
     // hugetlbfs-backed anonymous guest memory (candidate #1, take 2)" and
@@ -206,11 +229,10 @@ fn main() {
     )
     .expect("failed to build/boot microVM");
 
-    // vmlinux/initrd are in guest memory now and nothing reads the slots
-    // again - drop their pages from our RSS (~8MB packed+lz4, ~16MB packed).
+    // vmlinux/initrd are in guest memory now and nothing reads the payload
+    // again - drop its pages from our RSS (~5MB packed+lz4, ~13MB packed).
     // After boot, so it's off the guest's critical path.
-    release_pages(&VMLINUX_SLOT);
-    release_pages(&INITRD_SLOT);
+    release_pages(payload);
 
     // Same event loop firecracker's own main.rs runs post-construction -
     // this is what actually keeps devices/vsock functioning, not just the

@@ -471,7 +471,7 @@ pub fn load_kernel<F: Read + ReadVolatile + Seek>(
 }
 
 /// Magic prefix of joos-fire's lz4 kernel format. Must match `LZ4_MAGIC` in
-/// src/joos-fire/vmlinux_pack.rs, whose pack_vmlinux_lz4() documents the layout.
+/// joos's tools/assemble.js, whose pack_vmlinux_lz4() documents the layout.
 pub const KERNEL_LZ4_MAGIC: [u8; 8] = *b"JOOSLZ4\x01";
 
 fn lz4_take<'a>(

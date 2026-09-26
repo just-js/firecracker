@@ -30,7 +30,7 @@ pub enum InitrdError {
 }
 
 /// Magic prefix of joos-fire's chunked lz4 initrd format. Must match
-/// `INITRD_LZ4_MAGIC` in src/joos-fire/vmlinux_pack.rs, whose
+/// `INITRD_LZ4_MAGIC` in joos's tools/assemble.js, whose
 /// pack_initrd_lz4() documents the layout.
 pub const INITRD_LZ4_MAGIC: [u8; 8] = *b"JOOSLZI\x01";
 
