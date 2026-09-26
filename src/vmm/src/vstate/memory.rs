@@ -502,6 +502,53 @@ impl GuestMemoryRegion for GuestRegionMmapExt {
     }
 }
 
+/// Alignment of anonymous guest memory mappings. KVM can only map guest
+/// memory with 2 MiB EPT/NPT entries where the guest physical and host virtual
+/// addresses agree modulo 2 MiB; guest regions start 2 MiB-aligned, so the
+/// host mapping must too. Otherwise every guest page is mapped at 4 KiB, even
+/// when the host backs it with transparent huge pages: ~4x slower kernel boot
+/// observed (joos doc/BENCH.md section 17). Kernels before 6.7 don't
+/// align large anonymous mappings on their own.
+const ANON_GUEST_MEM_ALIGN: usize = 2 << 20;
+
+/// Maps `size` bytes of anonymous memory at an `ANON_GUEST_MEM_ALIGN`-aligned
+/// address: maps `size + ANON_GUEST_MEM_ALIGN`, then unmaps the unaligned head
+/// and the tail. The mapping is never unmapped (a raw-pointer `MmapRegion`
+/// doesn't own it); guest memory lives as long as the VMM process.
+fn mmap_aligned_anonymous(size: usize, flags: libc::c_int) -> Result<*mut u8, MemoryError> {
+    let len = size + ANON_GUEST_MEM_ALIGN;
+    // SAFETY: a new anonymous mapping at an address the kernel chooses.
+    let addr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            flags,
+            -1,
+            0,
+        )
+    };
+    if addr == libc::MAP_FAILED {
+        return Err(MemoryError::MmapRegionError(MmapRegionError::Mmap(
+            std::io::Error::last_os_error(),
+        )));
+    }
+    let start = addr as usize;
+    let aligned = start.next_multiple_of(ANON_GUEST_MEM_ALIGN);
+    let end = aligned + size;
+    // SAFETY: both ranges lie inside the mapping created above and outside
+    // [aligned, end), which is what the caller gets.
+    unsafe {
+        if aligned > start {
+            libc::munmap(start as *mut c_void, aligned - start);
+        }
+        if start + len > end {
+            libc::munmap(end as *mut c_void, start + len - end);
+        }
+    }
+    Ok(aligned as *mut u8)
+}
+
 /// Creates a `Vec` of `GuestRegionMmap` with the given configuration
 pub fn create(
     regions: impl Iterator<Item = (GuestAddress, usize)>,
@@ -524,6 +571,11 @@ pub fn create(
                 let file_offset = FileOffset::from_arc(Arc::clone(file), offset);
 
                 builder = builder.with_file_offset(file_offset);
+            } else if mmap_flags & libc::MAP_HUGETLB == 0 {
+                // hugetlbfs mappings are aligned to their page size already.
+                let ptr = mmap_aligned_anonymous(size, libc::MAP_NORESERVE | mmap_flags)?;
+                // SAFETY: [ptr, ptr + size) is the mapping just created above.
+                builder = unsafe { builder.with_raw_mmap_pointer(ptr) };
             }
 
             offset = match offset.checked_add(size as u64) {
