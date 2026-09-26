@@ -1,9 +1,9 @@
 // A custom firecracker launcher that boots the vmlinux/initrd.cpio/config
-// appended to its own binary (see payload()) and calls vmm's
-// VMM-construction API in-process, instead of this project's usual wrapper (memfd_create + write + fexecve
-// into a stock firecracker binary). Eliminates that wrapper's ~10-11ms of
-// memfd writes entirely - see FIRECRACKER.md and BOOT_PROFILE.md in the
-// parent joos project for the full reasoning and measurements.
+// appended to its own binary (see payload()) and calls vmm's VMM-construction
+// API in-process, instead of this project's usual wrapper (memfd_create + write
+// + fexecve into a stock firecracker binary). Eliminates that wrapper's
+// ~10-11ms of memfd writes entirely - see FIRECRACKER.md and BOOT_PROFILE.md in
+// the parent joos project for the full reasoning and measurements.
 //
 // No control/API socket - this is deliberately the run-without-api
 // equivalent of firecracker's own main.rs, with the HTTP API server left
@@ -133,7 +133,7 @@ fn main() {
     // Without this, log::warn!/info! (used by e.g. the boot-timer device's
     // Guest-boot-time line) are silent no-ops - firecracker's own main.rs
     // does this via its --level CLI arg, which joos-fire doesn't have.
-    LOGGER.init().expect("failed to init logger");
+    LOGGER.init().unwrap_or_else(|e| panic!("failed to init logger: {e}"));
     LOGGER
         .update(LoggerConfig {
             log_path: None,
@@ -142,7 +142,7 @@ fn main() {
             show_log_origin: None,
             module: None,
         })
-        .expect("failed to configure logger level");
+        .unwrap_or_else(|e| panic!("failed to configure logger level: {e}"));
 
     let instance_info = InstanceInfo {
         id: "anonymous-instance".to_string(),
@@ -151,13 +151,14 @@ fn main() {
         app_name: "joos-fire".to_string(),
     };
 
-    let mut event_manager = EventManager::new().expect("failed to create EventManager");
+    let mut event_manager =
+        EventManager::new().unwrap_or_else(|e| panic!("failed to create EventManager: {e}"));
 
     let payload = payload();
     let config_json = std::str::from_utf8(blob(payload, KIND_CONFIG))
-        .expect("embedded config JSON is not UTF-8");
+        .unwrap_or_else(|e| panic!("embedded config JSON is not UTF-8: {e}"));
     let mut vm_resources = VmResources::from_json(config_json, &instance_info, 0, None)
-        .expect("failed to parse embedded config JSON");
+        .unwrap_or_else(|e| panic!("failed to parse embedded config JSON: {e}"));
     // Matches --boot-timer on the stock firecracker launch this replaces.
     vm_resources.boot_timer = true;
     // The whole point: load straight from the embedded bytes above, instead
@@ -227,7 +228,7 @@ fn main() {
         &mut event_manager,
         &seccomp_filters,
     )
-    .expect("failed to build/boot microVM");
+    .unwrap_or_else(|e| panic!("failed to build/boot microVM: {e}"));
 
     // vmlinux/initrd are in guest memory now and nothing reads the payload
     // again - drop its pages from our RSS (~5MB packed+lz4, ~13MB packed).
@@ -238,7 +239,7 @@ fn main() {
     // this is what actually keeps devices/vsock functioning, not just the
     // build_and_boot_microvm call above.
     loop {
-        event_manager.run().expect("event manager run failed");
+        event_manager.run().unwrap_or_else(|e| panic!("event manager run failed: {e}"));
         match vmm.lock().unwrap().shutdown_exit_code() {
             Some(FcExitCode::Ok) => break,
             Some(exit_code) => {

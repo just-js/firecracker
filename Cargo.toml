@@ -36,6 +36,8 @@ panic = "abort"
 
 [profile.release]
 panic = "abort"
+lto = "fat"
+opt-level = "s"
 
 [profile.bench]
 strip = "debuginfo"
