@@ -114,6 +114,11 @@ pub struct VsockMuxer {
     /// This appears to have been a design decision dating back to the initial introduction of the
     /// vsock implementation.
     pub(crate) local_port_last: u32,
+    /// joos terminal mode: streams handed to guest-initiated connections to these host ports,
+    /// instead of connecting to `<host_sock_path>_<port>` (see `new_terminal()`).
+    presets: HashMap<u32, UnixStream>,
+    /// joos terminal mode: no Unix socket files; guest connections to other ports are refused.
+    terminal: bool,
 }
 
 impl VsockChannel for VsockMuxer {
@@ -311,11 +316,42 @@ impl VsockMuxer {
         let host_sock = UnixListener::bind(&host_sock_path)
             .and_then(|sock| sock.set_nonblocking(true).map(|_| sock))
             .map_err(VsockUnixBackendError::UnixBind)?;
+        Self::with_listener(cid, host_sock, host_sock_path, HashMap::new(), false)
+    }
 
+    /// joos terminal mode: a muxer with no Unix socket files at all. Guest-initiated
+    /// connections to a port in `presets` get that stream as their host side (the other end
+    /// of a socketpair joos-fire owns); any other guest connection is refused. The host
+    /// listener is bound to a Linux abstract socket name instead of a path, so nothing touches
+    /// the file system (binding a socket file fails on e.g. WSL2's Windows-drive mounts).
+    /// Nothing connects to it: host-initiated connections aren't used in this mode.
+    pub fn new_terminal(
+        cid: u64,
+        presets: HashMap<u32, UnixStream>,
+    ) -> Result<Self, VsockUnixBackendError> {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::SocketAddr;
+        let name = format!("joos-fire-vsock-{}", std::process::id());
+        let host_sock = SocketAddr::from_abstract_name(name.as_bytes())
+            .and_then(|addr| UnixListener::bind_addr(&addr))
+            .and_then(|sock| sock.set_nonblocking(true).map(|_| sock))
+            .map_err(VsockUnixBackendError::UnixBind)?;
+        Self::with_listener(cid, host_sock, String::new(), presets, true)
+    }
+
+    fn with_listener(
+        cid: u64,
+        host_sock: UnixListener,
+        host_sock_path: String,
+        presets: HashMap<u32, UnixStream>,
+        terminal: bool,
+    ) -> Result<Self, VsockUnixBackendError> {
         let mut muxer = Self {
             cid,
             host_sock,
             host_sock_path,
+            presets,
+            terminal,
             epoll: Epoll::new().map_err(VsockUnixBackendError::EpollFdCreate)?,
             rxq: MuxerRxQ::new(),
             conn_map: HashMap::with_capacity(defs::MAX_CONNECTIONS),
@@ -613,9 +649,15 @@ impl VsockMuxer {
     /// connection object will be created and added to the connection pool. On failure, a new
     /// RST packet will be scheduled for delivery to the guest.
     fn handle_peer_request_pkt(&mut self, pkt: &VsockPacketTx) {
-        let port_path = format!("{}_{}", self.host_sock_path, pkt.hdr.dst_port());
+        // joos terminal mode: a preset stream for this port (taken, so one connection per
+        // port), or refuse; never a socket file.
+        let stream = match self.presets.remove(&pkt.hdr.dst_port()) {
+            Some(stream) => Ok(stream),
+            None if self.terminal => Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+            None => UnixStream::connect(format!("{}_{}", self.host_sock_path, pkt.hdr.dst_port())),
+        };
 
-        UnixStream::connect(port_path)
+        stream
             .and_then(|stream| stream.set_nonblocking(true).map(|_| stream))
             .map_err(VsockUnixBackendError::UnixConnect)
             .and_then(|stream| {

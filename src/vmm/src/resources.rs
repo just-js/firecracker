@@ -104,6 +104,10 @@ pub struct VmmConfig {
     /// ICANON/ECHO/ISIG off), for interactive programs on the guest console.
     #[serde(default)]
     pub terminal: bool,
+    /// joos: with `terminal` and a vsock device (the vsock terminal), the file the serial
+    /// console (kernel messages) is written to, truncated at start; without it, nowhere.
+    #[serde(default)]
+    pub console: Option<PathBuf>,
 }
 
 /// A data structure that encapsulates the device configurations
@@ -147,6 +151,8 @@ pub struct VmResources {
     pub boot_timer: bool,
     /// joos: full raw mode for the host terminal (VmmConfig::terminal).
     pub terminal: bool,
+    /// joos vsock terminal: the host-side streams for joos-fire to take (`terminal` + vsock).
+    pub terminal_streams: Option<crate::TerminalStreams>,
     /// Whether or not to use PCIe transport for VirtIO devices.
     pub pci_enabled: bool,
     /// Where serial console output should be written to
@@ -219,7 +225,31 @@ impl VmResources {
         }
 
         if let Some(vsock_config) = vmm_config.vsock {
-            resources.set_vsock_device(vsock_config)?;
+            if vmm_config.terminal {
+                // joos vsock terminal: socketpairs instead of Unix socket files, and the
+                // serial console (kernel messages) off the terminal.
+                let (data, data_backend) = std::os::unix::net::UnixStream::pair()?;
+                let (resize, resize_backend) = std::os::unix::net::UnixStream::pair()?;
+                let presets = std::collections::HashMap::from([
+                    (crate::TERMINAL_DATA_PORT, data_backend),
+                    (crate::TERMINAL_RESIZE_PORT, resize_backend),
+                ]);
+                resources.vsock.insert_terminal(vsock_config, presets)?;
+                resources.terminal_streams = Some(crate::TerminalStreams { data, resize });
+                let console = vmm_config
+                    .console
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("/dev/null"));
+                // Firecracker opens it without truncating; start each run's log empty.
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&console)?;
+                resources.serial_out_path = Some(console);
+            } else {
+                resources.set_vsock_device(vsock_config)?;
+            }
         }
 
         if let Some(balloon_config) = vmm_config.balloon {
@@ -570,6 +600,7 @@ impl From<&VmResources> for VmmConfig {
             serial_config: None,
             memory_hotplug: resources.memory_hotplug.clone(),
             terminal: resources.terminal,
+            console: None,
         }
     }
 }

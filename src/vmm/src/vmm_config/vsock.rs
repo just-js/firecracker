@@ -100,6 +100,24 @@ impl VsockBuilder {
         Ok(())
     }
 
+    /// joos terminal mode: a vsock device whose backend hands guest connections to the
+    /// `presets` ports to those streams, with no Unix socket files (see
+    /// `VsockMuxer::new_terminal`). `cfg.uds_path` is ignored.
+    pub fn insert_terminal(
+        &mut self,
+        cfg: VsockDeviceConfig,
+        presets: std::collections::HashMap<u32, std::os::unix::net::UnixStream>,
+    ) -> Result<(), VsockConfigError> {
+        let backend = VsockUnixBackend::new_terminal(u64::from(cfg.guest_cid), presets)?;
+        let vsock = Vsock::new(u64::from(cfg.guest_cid), backend)
+            .map_err(VsockConfigError::CreateVsockDevice)?;
+        self.inner = Some(VsockAndUnixPath {
+            uds_path: String::new(),
+            vsock: Arc::new(Mutex::new(vsock)),
+        });
+        Ok(())
+    }
+
     /// Provides a reference to the Vsock if present.
     pub fn get(&self) -> Option<&MutexVsockUnix> {
         self.inner.as_ref().map(|pair| &pair.vsock)

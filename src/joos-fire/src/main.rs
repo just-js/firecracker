@@ -112,6 +112,138 @@ fn release_pages(payload: &'static [u8]) {
     }
 }
 
+/// The host terminal's size as (cols, rows), from stdin, or `None` if stdin
+/// isn't a terminal or reports no size.
+fn terminal_size() -> Option<(u16, u16)> {
+    // SAFETY: TIOCGWINSZ on stdin fills in a winsize we own; the return
+    // value is checked.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    if rc != 0 || ws.ws_col == 0 || ws.ws_row == 0 {
+        return None;
+    }
+    Some((ws.ws_col, ws.ws_row))
+}
+
+/// Writes all of `buf` to `fd`, waiting (poll) while it would block: stdout
+/// can be non-blocking, since start_vcpus() sets O_NONBLOCK on stdin and a
+/// terminal's stdin/stdout often share one open file description.
+fn write_all_fd(fd: libc::c_int, mut buf: &[u8]) -> bool {
+    while !buf.is_empty() {
+        // SAFETY: writes from a live slice of the given length.
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if n > 0 {
+            buf = &buf[n as usize..];
+            continue;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EAGAIN) => {
+                let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+                // SAFETY: one valid pollfd.
+                unsafe { libc::poll(&mut pfd, 1, -1) };
+            }
+            Some(libc::EINTR) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// joos vsock terminal: relays the host terminal (stdin/stdout) and the data
+/// stream (the guest app's pty, through the vsock backend) until the guest
+/// closes it. On stdin EOF (e.g. piped input) it only stops reading stdin.
+fn relay_terminal(data: std::os::unix::net::UnixStream) {
+    use std::os::unix::io::AsRawFd;
+    let dfd = data.as_raw_fd();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut stdin_open = true;
+    loop {
+        let mut fds = [
+            libc::pollfd { fd: dfd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd {
+                fd: libc::STDIN_FILENO,
+                events: if stdin_open { libc::POLLIN } else { 0 },
+                revents: 0,
+            },
+        ];
+        // SAFETY: two valid pollfds.
+        if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 {
+            continue; // EINTR
+        }
+        if fds[0].revents != 0 {
+            // SAFETY: reads into our own buffer.
+            let n = unsafe { libc::read(dfd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                if !write_all_fd(libc::STDOUT_FILENO, &buf[..n as usize]) {
+                    return;
+                }
+            } else if n == 0 || !is_retry_errno() {
+                return; // the guest closed the terminal
+            }
+        }
+        if stdin_open && fds[1].revents != 0 {
+            // SAFETY: reads into our own buffer.
+            let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                if !write_all_fd(dfd, &buf[..n as usize]) {
+                    return;
+                }
+            } else if n == 0 || !is_retry_errno() {
+                stdin_open = false;
+            }
+        }
+    }
+}
+
+fn is_retry_errno() -> bool {
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EAGAIN) | Some(libc::EINTR)
+    )
+}
+
+/// joos vsock terminal: sends the host terminal's size as `{u16 cols, u16
+/// rows}` (little-endian) now and on every SIGWINCH (blocked in all threads,
+/// received here through a signalfd).
+fn relay_resize(resize: std::os::unix::net::UnixStream) {
+    use std::os::unix::io::AsRawFd;
+    let send = |fd| match terminal_size() {
+        Some((cols, rows)) => {
+            let mut rec = [0u8; 4];
+            rec[..2].copy_from_slice(&cols.to_le_bytes());
+            rec[2..].copy_from_slice(&rows.to_le_bytes());
+            write_all_fd(fd, &rec)
+        }
+        None => true,
+    };
+    let fd = resize.as_raw_fd();
+    if !send(fd) {
+        return;
+    }
+    // SAFETY: a sigset we own, initialised by sigemptyset; signalfd's result
+    // is checked.
+    let sfd = unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGWINCH);
+        libc::signalfd(-1, &set, libc::SFD_CLOEXEC)
+    };
+    if sfd < 0 {
+        return;
+    }
+    let mut info = [0u8; std::mem::size_of::<libc::signalfd_siginfo>()];
+    loop {
+        // SAFETY: reads one signalfd_siginfo into our own buffer.
+        let n = unsafe { libc::read(sfd, info.as_mut_ptr().cast(), info.len()) };
+        if n < 0 && !is_retry_errno() {
+            return;
+        }
+        if n > 0 && !send(fd) {
+            return;
+        }
+    }
+}
+
 /// Reads the number of currently-free 2M hugetlbfs pages on this host, or
 /// `None` if the sysfs file doesn't exist (no hugetlbfs support/reservation
 /// at all) or doesn't parse - both treated as "don't use huge pages" by the
@@ -176,6 +308,43 @@ fn main() {
     // tools/assemble.js's pack_config()).
     vm_resources.kernel_bytes = Some(blob(payload, KIND_VMLINUX));
     vm_resources.initrd_bytes = Some(blob(payload, KIND_INITRD));
+
+    // "terminal": true - pass the host terminal's size to the guest as
+    // joos_winsize=<cols>x<rows>: the kernel hands unknown, dot-free
+    // parameters to init as environment variables, and init.c sets it on
+    // the console (see joos doc/TERMINAL.md, step 1).
+    if vm_resources.terminal {
+        if let Some((cols, rows)) = terminal_size() {
+            if let Some(boot_config) = vm_resources.boot_source.builder.as_mut() {
+                boot_config
+                    .cmdline
+                    .insert_str(format!("joos_winsize={cols}x{rows}"))
+                    .unwrap_or_else(|e| panic!("kernel command line: {e}"));
+            }
+        }
+    }
+
+    // "terminal": true plus a vsock device: the vsock terminal (joos doc/TERMINAL.md,
+    // step 2). init.c sees joos_vterm=1, runs the app on a pty and connects its data and
+    // resize channels to us; the serial console only carries kernel messages. SIGWINCH is
+    // blocked here, before any vCPU thread exists, so every thread inherits the mask and
+    // only relay_resize()'s signalfd receives it.
+    let terminal_streams = vm_resources.terminal_streams.take();
+    if terminal_streams.is_some() {
+        if let Some(boot_config) = vm_resources.boot_source.builder.as_mut() {
+            boot_config
+                .cmdline
+                .insert_str("joos_vterm=1")
+                .unwrap_or_else(|e| panic!("kernel command line: {e}"));
+        }
+        // SAFETY: a sigset we own, initialised by sigemptyset before use.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGWINCH);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        }
+    }
 
     // Hugetlbfs-backed anonymous guest memory - see joos/INIT.md's "Plan:
     // hugetlbfs-backed anonymous guest memory (candidate #1, take 2)" and
@@ -243,6 +412,13 @@ fn main() {
     // again - drop its pages from our RSS (~5MB packed+lz4, ~13MB packed).
     // After boot, so it's off the guest's critical path.
     release_pages(payload);
+
+    // After boot, so the host terminal is already in raw mode (start_vcpus).
+    if let Some(streams) = terminal_streams {
+        let vmm::TerminalStreams { data, resize } = streams;
+        std::thread::spawn(move || relay_terminal(data));
+        std::thread::spawn(move || relay_resize(resize));
+    }
 
     // Same event loop firecracker's own main.rs runs post-construction -
     // this is what actually keeps devices/vsock functioning, not just the

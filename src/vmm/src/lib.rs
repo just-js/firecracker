@@ -431,6 +431,7 @@ impl Vmm {
             memory_hotplug,
             // joos: not kept after boot
             terminal: false,
+            console: None,
         }
     }
 
@@ -759,6 +760,25 @@ fn construct_kvm_mpidrs(vcpu_states: &[VcpuState]) -> Vec<u64> {
             cpu_affid << 32
         })
         .collect()
+}
+
+/// joos vsock terminal ("terminal": true + a vsock device): the host ports the
+/// guest's init connects to (CID 2) for the app's pty data and for window
+/// sizes (`{u16 cols, u16 rows}` little-endian records). Must match init.h.
+pub const TERMINAL_DATA_PORT: u32 = 5100;
+/// See `TERMINAL_DATA_PORT`.
+pub const TERMINAL_RESIZE_PORT: u32 = 5101;
+
+/// joos vsock terminal: the host-side ends of the data and resize
+/// socketpairs; the other ends are the vsock backend's host side for those
+/// ports. joos-fire relays the host terminal through `data` and writes window
+/// sizes to `resize`.
+#[derive(Debug)]
+pub struct TerminalStreams {
+    /// Host terminal <-> the guest app's pty.
+    pub data: std::os::unix::net::UnixStream,
+    /// Window size records to the guest.
+    pub resize: std::os::unix::net::UnixStream,
 }
 
 /// stdin's terminal settings from before set_raw_terminal(), for
