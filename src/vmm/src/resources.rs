@@ -108,6 +108,9 @@ pub struct VmmConfig {
     /// console (kernel messages) is written to, truncated at start; without it, nowhere.
     #[serde(default)]
     pub console: Option<PathBuf>,
+    /// joos: create and configure the network interface's tap on the host (joos-fire).
+    #[serde(default)]
+    pub tap: Option<crate::vmm_config::net::TapSetup>,
 }
 
 /// A data structure that encapsulates the device configurations
@@ -153,6 +156,8 @@ pub struct VmResources {
     pub terminal: bool,
     /// joos vsock terminal: the host-side streams for joos-fire to take (`terminal` + vsock).
     pub terminal_streams: Option<crate::TerminalStreams>,
+    /// joos: host-side tap setup for joos-fire to do (VmmConfig::tap).
+    pub tap: Option<crate::vmm_config::net::TapSetup>,
     /// Whether or not to use PCIe transport for VirtIO devices.
     pub pci_enabled: bool,
     /// Where serial console output should be written to
@@ -193,6 +198,7 @@ impl VmResources {
         let mut resources: Self = Self {
             mmds_size_limit,
             terminal: vmm_config.terminal,
+            tap: vmm_config.tap.clone(),
             ..Default::default()
         };
         if let Some(machine_config) = vmm_config.machine_config {
@@ -601,6 +607,7 @@ impl From<&VmResources> for VmmConfig {
             memory_hotplug: resources.memory_hotplug.clone(),
             terminal: resources.terminal,
             console: None,
+            tap: resources.tap.clone(),
         }
     }
 }

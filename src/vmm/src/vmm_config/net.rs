@@ -47,6 +47,32 @@ impl From<&Net> for NetworkInterfaceConfig {
     }
 }
 
+/// joos: who provides the host side of the network interface's tap (VmmConfig::tap).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TapMode {
+    /// The tap must already exist (stock behaviour).
+    #[default]
+    Existing,
+    /// If the tap doesn't exist, the VMM creates it (non-persistent: it goes away when the
+    /// VMM exits), gives it `host_ip` and brings it up, and sets up routing.
+    Ephemeral,
+    /// Like `Ephemeral`, but the tap is created persistent and outlives the VMM.
+    Persistent,
+}
+
+/// joos: host-side network setup joos-fire does before the guest runs (VmmConfig::tap).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TapSetup {
+    /// Who provides the tap.
+    pub mode: TapMode,
+    /// The tap's (host-side) address, the guest's gateway.
+    pub host_ip: std::net::Ipv4Addr,
+    /// The tap's prefix length.
+    pub prefix_len: u8,
+}
+
 /// The data fed into a network iface update request. Currently, only the RX and TX rate limiters
 /// can be updated.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

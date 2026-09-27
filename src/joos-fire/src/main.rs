@@ -12,12 +12,15 @@
 //
 // Expects fire.ext4 in the current directory, same as build/fire.
 
-use vmm::builder::build_and_boot_microvm;
+mod host_net;
+
+use vmm::builder::build_microvm_for_boot;
 use vmm::logger::{LOGGER, LevelFilter, LoggerConfig};
-use vmm::resources::VmResources;
+use vmm::resources::{VmResources, VmmConfig};
 use vmm::seccomp::get_empty_filters;
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
 use vmm::vmm_config::machine_config::HugePageConfig;
+use vmm::vmm_config::net::TapMode;
 use vmm::{EventManager, FcExitCode};
 
 // The kernel, initrd and config aren't built into this binary: joos's
@@ -298,6 +301,31 @@ fn main() {
     let payload = payload();
     let config_json = std::str::from_utf8(blob(payload, KIND_CONFIG))
         .unwrap_or_else(|e| panic!("embedded config JSON is not UTF-8: {e}"));
+
+    // "tap": host-side setup of the network interface's tap (host_net.rs),
+    // decided before from_json(), which already opens the tap (building the
+    // net device runs Tap::open_named's TUNSETIFF). A persistent tap is made
+    // now; an ephemeral one is made by that TUNSETIFF and configured once the
+    // VM is built. Either way only if the tap is missing: an existing one is
+    // used as it is.
+    let config: VmmConfig = serde_json::from_str(config_json)
+        .unwrap_or_else(|e| panic!("failed to parse embedded config JSON: {e}"));
+    let tap = match (config.tap, config.network_interfaces.first()) {
+        (Some(setup), Some(iface)) if setup.mode != TapMode::Existing => {
+            let name = iface.host_dev_name.clone();
+            if host_net::tap_exists(&name) {
+                None
+            } else {
+                if setup.mode == TapMode::Persistent {
+                    host_net::create_persistent_tap(&name)
+                        .unwrap_or_else(|e| panic!("tap {name}: create: {e}"));
+                }
+                Some((name, setup))
+            }
+        }
+        _ => None,
+    };
+
     let mut vm_resources = VmResources::from_json(config_json, &instance_info, 0, None)
         .unwrap_or_else(|e| panic!("failed to parse embedded config JSON: {e}"));
     // Matches --boot-timer on the stock firecracker launch this replaces.
@@ -400,13 +428,29 @@ fn main() {
     // Matches --no-seccomp on the stock firecracker launch this replaces.
     let seccomp_filters = get_empty_filters();
 
-    let vmm = build_and_boot_microvm(
+    // build_and_boot_microvm() in two halves: the vCPUs start paused, so the
+    // tap setup and the capability drop below happen before the guest runs.
+    let vmm = build_microvm_for_boot(
         &instance_info,
         &vm_resources,
         &mut event_manager,
         &seccomp_filters,
     )
-    .unwrap_or_else(|e| panic!("failed to build/boot microVM: {e}"));
+    .unwrap_or_else(|e| panic!("failed to build microVM: {e}"));
+
+    if let Some((name, setup)) = tap {
+        host_net::configure_tap(&name, setup.host_ip, setup.prefix_len)
+            .unwrap_or_else(|e| panic!("tap {name}: configure: {e}"));
+        host_net::ensure_routing().unwrap_or_else(|e| panic!("tap {name}: routing: {e}"));
+    }
+    // Whatever the mode: nothing after this needs CAP_NET_ADMIN (the tap fd is
+    // open), so a guest that escapes into the VMM doesn't get it.
+    host_net::drop_net_admin().unwrap_or_else(|e| panic!("dropping CAP_NET_ADMIN: {e}"));
+
+    vmm.lock()
+        .unwrap()
+        .resume_vm()
+        .unwrap_or_else(|e| panic!("failed to boot microVM: {e}"));
 
     // vmlinux/initrd are in guest memory now and nothing reads the payload
     // again - drop its pages from our RSS (~5MB packed+lz4, ~13MB packed).

@@ -432,6 +432,7 @@ impl Vmm {
             // joos: not kept after boot
             terminal: false,
             console: None,
+            tap: None,
         }
     }
 
