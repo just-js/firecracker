@@ -429,6 +429,8 @@ impl Vmm {
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots
             serial_config: None,
             memory_hotplug,
+            // joos: not kept after boot
+            terminal: false,
         }
     }
 
@@ -759,6 +761,61 @@ fn construct_kvm_mpidrs(vcpu_states: &[VcpuState]) -> Vec<u64> {
         .collect()
 }
 
+/// stdin's terminal settings from before set_raw_terminal(), for
+/// restore_terminal().
+static SAVED_TERMIOS: Mutex<Option<libc::termios>> = Mutex::new(None);
+
+/// Puts stdin's terminal (if it is one) into full raw mode, like ssh or
+/// cfmakeraw() on the input side, after saving its settings for
+/// restore_terminal(). vmm_sys_util's set_raw_mode() only clears
+/// ICANON/ECHO/ISIG, so ICRNL stayed on and the host turned Enter's \r into
+/// \n: fine for a shell, but guest programs that put the console into raw
+/// mode themselves (lo's repl/bestlines) don't take \n as Enter. Output
+/// processing (OPOST) stays on, so the VMM's own log lines keep their \r\n.
+pub fn set_raw_terminal() {
+    let fd = libc::STDIN_FILENO;
+    // SAFETY: isatty/tcgetattr/tcsetattr on stdin with a termios that
+    // tcgetattr fills in completely; return values are checked.
+    unsafe {
+        if libc::isatty(fd) != 1 {
+            return;
+        }
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut termios) != 0 {
+            warn!("Cannot get the terminal's settings: {}", io::Error::last_os_error());
+            return;
+        }
+        *SAVED_TERMIOS.lock().unwrap() = Some(termios);
+        termios.c_iflag &= !(libc::IGNBRK
+            | libc::BRKINT
+            | libc::PARMRK
+            | libc::ISTRIP
+            | libc::INLCR
+            | libc::IGNCR
+            | libc::ICRNL
+            | libc::IXON);
+        termios.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG | libc::IEXTEN);
+        if libc::tcsetattr(fd, libc::TCSANOW, &termios) != 0 {
+            warn!("Cannot set raw mode for the terminal: {}", io::Error::last_os_error());
+        }
+    }
+}
+
+/// Restores stdin's terminal settings saved by set_raw_terminal(), or falls
+/// back to canonical mode if nothing was saved. Safe to call more than once,
+/// and from a panic hook (a poisoned lock is still used).
+pub fn restore_terminal() {
+    let saved = SAVED_TERMIOS.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(termios) = saved {
+        // SAFETY: tcsetattr on stdin with settings tcgetattr returned.
+        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &termios) } != 0 {
+            warn!("Cannot restore the terminal's settings: {}", io::Error::last_os_error());
+        }
+    } else if let Err(err) = std::io::stdin().lock().set_canon_mode() {
+        warn!("Cannot set canonical mode for the terminal. {:?}", err);
+    }
+}
+
 impl Drop for Vmm {
     fn drop(&mut self) {
         if let Some(kvm_vm) = self.vm.as_kvm() {
@@ -766,9 +823,7 @@ impl Drop for Vmm {
             kvm_vm.shutdown_vcpus();
         }
 
-        if let Err(err) = std::io::stdin().lock().set_canon_mode() {
-            warn!("Cannot set canonical mode for the terminal. {:?}", err);
-        }
+        restore_terminal();
 
         // Write the metrics before exiting.
         if let Err(err) = METRICS.write() {

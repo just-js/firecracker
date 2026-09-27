@@ -361,6 +361,7 @@ pub fn build_microvm_for_boot(
                 .get("vcpu")
                 .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vcpu".to_string()))?
                 .clone(),
+            vm_resources.terminal,
         )
         .map_err(VmmError::VcpuStart)?;
     vmm.lock().unwrap().instance_info.state = VmState::Paused;
@@ -556,6 +557,8 @@ pub fn build_microvm_from_snapshot(
             .get("vcpu")
             .ok_or(BuildMicrovmFromSnapshotError::MissingVcpuSeccompFilters)?
             .clone(),
+        // joos: terminal mode isn't part of snapshots; upstream behaviour
+        false,
     )?;
 
     let vmm = Arc::new(Mutex::new(vmm));

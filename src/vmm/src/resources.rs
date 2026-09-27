@@ -100,6 +100,10 @@ pub struct VmmConfig {
     #[serde(skip)]
     pub serial_config: Option<SerialConfig>,
     pub memory_hotplug: Option<MemoryHotplugConfig>,
+    /// joos: put the host terminal into full raw mode (not just
+    /// ICANON/ECHO/ISIG off), for interactive programs on the guest console.
+    #[serde(default)]
+    pub terminal: bool,
 }
 
 /// A data structure that encapsulates the device configurations
@@ -141,6 +145,8 @@ pub struct VmResources {
     pub mmds_size_limit: usize,
     /// Whether or not to load boot timer device.
     pub boot_timer: bool,
+    /// joos: full raw mode for the host terminal (VmmConfig::terminal).
+    pub terminal: bool,
     /// Whether or not to use PCIe transport for VirtIO devices.
     pub pci_enabled: bool,
     /// Where serial console output should be written to
@@ -180,6 +186,7 @@ impl VmResources {
 
         let mut resources: Self = Self {
             mmds_size_limit,
+            terminal: vmm_config.terminal,
             ..Default::default()
         };
         if let Some(machine_config) = vmm_config.machine_config {
@@ -562,6 +569,7 @@ impl From<&VmResources> for VmmConfig {
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots.
             serial_config: None,
             memory_hotplug: resources.memory_hotplug.clone(),
+            terminal: resources.terminal,
         }
     }
 }

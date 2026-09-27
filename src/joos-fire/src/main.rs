@@ -125,6 +125,15 @@ fn free_hugepages_2m() -> Option<usize> {
 }
 
 fn main() {
+    // A panic after start_vcpus() put the host terminal into raw mode
+    // ("terminal": true) would otherwise leave it there: restore it first,
+    // then report the panic as usual.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        vmm::restore_terminal();
+        default_hook(info);
+    }));
+
     // Matches the wrapper's unlink() of stale sockets from a previous run -
     // vsock's bind() fails with EADDRINUSE otherwise. No fire.sock/API
     // socket to worry about here since there's no API server in this binary.
@@ -241,8 +250,14 @@ fn main() {
     loop {
         event_manager.run().unwrap_or_else(|e| panic!("event manager run failed: {e}"));
         match vmm.lock().unwrap().shutdown_exit_code() {
-            Some(FcExitCode::Ok) => break,
+            // Restore the terminal here: exit() skips Vmm's Drop, and on the
+            // Ok path other references can keep the Vmm alive past main.
+            Some(FcExitCode::Ok) => {
+                vmm::restore_terminal();
+                break;
+            }
             Some(exit_code) => {
+                vmm::restore_terminal();
                 eprintln!("[joos-fire] shutdown with exit code {exit_code:?}");
                 std::process::exit(exit_code as i32);
             }

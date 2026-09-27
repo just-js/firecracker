@@ -241,11 +241,18 @@ impl KvmVm {
         self: &Arc<Self>,
         mut vcpus: Vec<Vcpu>,
         vcpu_seccomp_filter: Arc<crate::seccomp::BpfProgram>,
+        terminal: bool,
     ) -> Result<(), StartVcpusError> {
         let vcpu_count = vcpus.len();
         let barrier = Arc::new(Barrier::new(vcpu_count + 1));
 
         let stdin = std::io::stdin().lock();
+        // joos: with "terminal": true in the config, full raw mode (input
+        // side), saving the settings for restore_terminal(); set_raw_mode()
+        // below then changes nothing more.
+        if terminal {
+            crate::set_raw_terminal();
+        }
         stdin.set_raw_mode().inspect_err(|&err| {
             crate::logger::warn!("Cannot set raw mode for the terminal. {:?}", err);
         })?;
