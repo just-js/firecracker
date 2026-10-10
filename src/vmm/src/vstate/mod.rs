@@ -7,6 +7,8 @@ pub mod bus;
 pub mod interrupts;
 /// Module with Kvm implementation.
 pub mod kvm;
+/// joos: KVM binary stats, printed at guest boot with JOOS_KVM_STATS=1.
+pub mod kvm_stats;
 /// Module with GuestMemory implementation.
 pub mod memory;
 /// Resource manager for devices.

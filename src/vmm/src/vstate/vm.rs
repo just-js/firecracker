@@ -174,6 +174,7 @@ impl KvmVm {
             attempt += 1;
         };
 
+        crate::vstate::kvm_stats::register(std::os::fd::AsRawFd::as_raw_fd(&fd), "vm");
         let vcpus_exit_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(VmError::EventFd)?;
 
         Ok(VmCommon {

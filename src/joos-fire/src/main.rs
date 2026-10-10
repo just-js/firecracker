@@ -38,7 +38,7 @@ const KIND_INITRD: u32 = 2;
 const KIND_CONFIG: u32 = 3;
 
 unsafe extern "C" {
-    // Linker-defined: the ELF header, i.e. this binary's load address.
+    // Linker-defined: where the ELF header was mapped.
     static __ehdr_start: u8;
 }
 
@@ -55,7 +55,15 @@ fn payload() -> &'static [u8] {
     };
     // SAFETY: see above.
     let phdrs = unsafe { std::slice::from_raw_parts(phdr, phnum) };
-    let base = (&raw const __ehdr_start) as usize;
+    // Load bias: where the segment holding the ELF header (file offset 0) was
+    // mapped, minus its p_vaddr. The load address for a static-PIE (first
+    // PT_LOAD at p_vaddr 0); 0 for a non-PIE executable, whose p_vaddrs are
+    // absolute (joos's FC_PIE=off).
+    let first = phdrs
+        .iter()
+        .find(|ph| ph.p_type == libc::PT_LOAD && ph.p_offset == 0)
+        .map_or(0, |ph| ph.p_vaddr as usize);
+    let bias = (&raw const __ehdr_start) as usize - first;
     for ph in phdrs {
         if ph.p_type != libc::PT_LOAD || ph.p_memsz < 16 {
             continue;
@@ -64,7 +72,7 @@ fn payload() -> &'static [u8] {
         // life of the process, and nothing in this program writes to it.
         let segment = unsafe {
             std::slice::from_raw_parts(
-                (base + ph.p_vaddr as usize) as *const u8,
+                (bias + ph.p_vaddr as usize) as *const u8,
                 ph.p_memsz as usize,
             )
         };
@@ -155,7 +163,14 @@ fn write_all_fd(fd: libc::c_int, mut buf: &[u8]) -> bool {
 /// joos vsock terminal: relays the host terminal (stdin/stdout) and the data
 /// stream (the guest app's pty, through the vsock backend) until the guest
 /// closes it. On stdin EOF (e.g. piped input) it only stops reading stdin.
-fn relay_terminal(data: std::os::unix::net::UnixStream) {
+/// `wake`: the read end of a pipe main() writes to when the guest has shut
+/// down. The relay then copies whatever is still in the stream to stdout
+/// without waiting for more, and returns, so main() can join it before the
+/// process exits. Without that, exit could kill the relay with output still
+/// unwritten: the end of a guest program's output was lost (2026-10-01).
+/// init's run_vterm() lingers on close until Firecracker has put everything
+/// into this stream, so by the time the guest has shut down, it's all here.
+fn relay_terminal(data: std::os::unix::net::UnixStream, wake: libc::c_int) {
     use std::os::unix::io::AsRawFd;
     let dfd = data.as_raw_fd();
     let mut buf = vec![0u8; 64 * 1024];
@@ -168,10 +183,22 @@ fn relay_terminal(data: std::os::unix::net::UnixStream) {
                 events: if stdin_open { libc::POLLIN } else { 0 },
                 revents: 0,
             },
+            libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 },
         ];
-        // SAFETY: two valid pollfds.
-        if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 {
+        // SAFETY: three valid pollfds.
+        if unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) } < 0 {
             continue; // EINTR
+        }
+        if fds[2].revents != 0 {
+            loop {
+                // SAFETY: reads into our own buffer, without blocking.
+                let n = unsafe {
+                    libc::recv(dfd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT)
+                };
+                if n <= 0 || !write_all_fd(libc::STDOUT_FILENO, &buf[..n as usize]) {
+                    return;
+                }
+            }
         }
         if fds[0].revents != 0 {
             // SAFETY: reads into our own buffer.
@@ -458,9 +485,18 @@ fn main() {
     release_pages(payload);
 
     // After boot, so the host terminal is already in raw mode (start_vcpus).
+    // relay_terminal()'s wake pipe and thread, to drain it before exiting.
+    let mut terminal_relay = None;
     if let Some(streams) = terminal_streams {
         let vmm::TerminalStreams { data, resize } = streams;
-        std::thread::spawn(move || relay_terminal(data));
+        let mut wake = [0 as libc::c_int; 2];
+        // SAFETY: pipe2 fills our two-int array.
+        if unsafe { libc::pipe2(wake.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            panic!("pipe2 (terminal relay): {}", std::io::Error::last_os_error());
+        }
+        let wake_r = wake[0];
+        let relay = std::thread::spawn(move || relay_terminal(data, wake_r));
+        terminal_relay = Some((wake[1], relay));
         std::thread::spawn(move || relay_resize(resize));
     }
 
@@ -473,15 +509,27 @@ fn main() {
             // Restore the terminal here: exit() skips Vmm's Drop, and on the
             // Ok path other references can keep the Vmm alive past main.
             Some(FcExitCode::Ok) => {
+                drain_terminal(terminal_relay.take());
                 vmm::restore_terminal();
                 break;
             }
             Some(exit_code) => {
+                drain_terminal(terminal_relay.take());
                 vmm::restore_terminal();
                 eprintln!("[joos-fire] shutdown with exit code {exit_code:?}");
                 std::process::exit(exit_code as i32);
             }
             None => continue,
         }
+    }
+}
+
+/// Tells relay_terminal() the guest has shut down and waits for it to copy
+/// the rest of the guest's output to stdout.
+fn drain_terminal(relay: Option<(libc::c_int, std::thread::JoinHandle<()>)>) {
+    if let Some((wake_w, handle)) = relay {
+        // SAFETY: writes one byte from a local to the pipe we created.
+        unsafe { libc::write(wake_w, [1u8].as_ptr().cast(), 1) };
+        let _ = handle.join();
     }
 }

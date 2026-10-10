@@ -168,7 +168,7 @@ impl Log for Logger {
             let result = if let Some(file) = &mut guard.target {
                 file.write_all(message.as_bytes())
             } else {
-                std::io::stdout().write_all(message.as_bytes())
+                write_stdout(message.as_bytes())
             };
 
             // If the write returns an error, increment missed log count.
@@ -180,6 +180,42 @@ impl Log for Logger {
     }
 
     fn flush(&self) {}
+}
+
+/// joos: writes a log line to stdout, waiting (poll) while stdout would block
+/// instead of dropping the line. Stdout can be non-blocking: start_vcpus()
+/// sets O_NONBLOCK on stdin, and a terminal's stdin and stdout usually share
+/// one open file description. After a burst of guest output (e.g. mini
+/// printing dmesg) the terminal can still be full, and write_all() failed
+/// with EAGAIN: the last Guest-boot-time line was sometimes missing
+/// (2026-10-10). As in serial.rs retry_would_block(), a failed write leaves
+/// stdout's buffer as it was, so retrying the same write is safe.
+fn write_stdout(mut buf: &[u8]) -> std::io::Result<()> {
+    fn retry<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+        loop {
+            match op() {
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    let mut pfd = libc::pollfd {
+                        fd: libc::STDOUT_FILENO,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    // SAFETY: one valid pollfd, for the duration of the call.
+                    unsafe { libc::poll(&mut pfd, 1, -1) };
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                result => return result,
+            }
+        }
+    }
+    let mut out = std::io::stdout().lock();
+    while !buf.is_empty() {
+        match retry(|| out.write(buf))? {
+            0 => return Err(std::io::ErrorKind::WriteZero.into()),
+            n => buf = &buf[n..],
+        }
+    }
+    retry(|| out.flush())
 }
 
 /// Strongly typed structure used to describe the logger.

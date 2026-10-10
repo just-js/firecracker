@@ -171,7 +171,7 @@ impl std::io::Write for SerialOut {
         }
 
         match &mut self.inner {
-            SerialOutInner::Stdout(stdout) => stdout.write(buf),
+            SerialOutInner::Stdout(stdout) => retry_would_block(|| stdout.write(buf)),
             SerialOutInner::File(file) => file.write(buf),
             SerialOutInner::Sink => Ok(buf.len()),
         }
@@ -179,8 +179,34 @@ impl std::io::Write for SerialOut {
     fn flush(&mut self) -> std::io::Result<()> {
         match &mut self.inner {
             SerialOutInner::Sink => Ok(()),
-            SerialOutInner::Stdout(stdout) => stdout.flush(),
+            SerialOutInner::Stdout(stdout) => retry_would_block(|| stdout.flush()),
             SerialOutInner::File(file) => file.flush(),
+        }
+    }
+}
+
+/// joos: runs `op` on stdout until it doesn't fail with WouldBlock, waiting
+/// (poll) for stdout to become writable in between. Stdout can be
+/// non-blocking: start_vcpus() sets O_NONBLOCK on stdin, and a terminal's
+/// stdin and stdout usually share one open file description. Without this,
+/// output to a terminal that's momentarily full failed with EAGAIN and the
+/// guest's serial bytes were dropped (seen as console output cut off
+/// mid-line). A failed write leaves stdout's buffer as it was, so retrying
+/// the same operation is safe.
+fn retry_would_block<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    loop {
+        match op() {
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                let mut pfd = libc::pollfd {
+                    fd: libc::STDOUT_FILENO,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // SAFETY: one valid pollfd, for the duration of the call.
+                unsafe { libc::poll(&mut pfd, 1, -1) };
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            result => return result,
         }
     }
 }

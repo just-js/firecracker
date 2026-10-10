@@ -128,6 +128,7 @@ impl Vcpu {
         let (event_sender, event_receiver) = channel();
         let (response_sender, response_receiver) = channel();
         let kvm_vcpu = KvmVcpu::new(index, vm).unwrap();
+        crate::vstate::kvm_stats::register(kvm_vcpu.fd.as_raw_fd(), &format!("vcpu{index}"));
 
         Ok(Vcpu {
             exit_evt,

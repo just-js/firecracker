@@ -46,6 +46,15 @@ pub struct PmemConfig {
     /// Map the file as read only
     #[serde(default)]
     pub read_only: bool,
+    /// joos: where the image starts in the file, page aligned (2 MiB aligned
+    /// for huge-page mappings), e.g. an erofs image appended to the joos-fire
+    /// binary itself, with `path_on_host` "/proc/self/exe". Default 0.
+    #[serde(default)]
+    pub offset: u64,
+    /// joos: the image's length in bytes. Default 0: from `offset` to the
+    /// end of the file.
+    #[serde(default)]
+    pub length: u64,
     /// Rate Limiter for flush operations.
     pub rate_limiter: Option<RateLimiterConfig>,
 }

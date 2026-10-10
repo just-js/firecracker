@@ -35,6 +35,7 @@ impl BusDevice for BootTimer {
                 boot_time_cpu_us,
                 boot_time_cpu_us / 1000
             );
+            crate::vstate::kvm_stats::dump();
         }
 
         None

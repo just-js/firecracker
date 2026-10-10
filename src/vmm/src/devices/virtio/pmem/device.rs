@@ -90,14 +90,37 @@ pub struct GuestPmemRegion {
 
 impl GuestPmemRegion {
     /// Allocate a new region in past_mmio64 memory.
+    ///
+    /// joos: falls back to the MMIO64 range when past_mmio64 is out of the
+    /// host's reach. past_mmio64 starts at 512 GiB, and KVM refuses memory
+    /// slots above the host's MAXPHYADDR (kvm_arch_prepare_memory_region()
+    /// checks kvm_mmu_max_gfn()): on a 39-bit CPU such as an 8th-gen Core,
+    /// KVM_SET_USER_MEMORY_REGION fails with EINVAL, and the guest (same
+    /// CPUID) couldn't address it either. MMIO64 (256-512 GiB) is for PCI
+    /// BARs, unused with pci=off as joos runs.
     fn new(vm: Arc<KvmVm>, size: u64) -> Result<Self, PmemError> {
         let start = {
             let mut alloc = vm.resource_allocator();
-            alloc
+            let range = alloc
                 .past_mmio64_memory
                 .allocate(size, Pmem::ALIGNMENT, AllocPolicy::FirstMatch)
-                .map_err(|_| PmemError::AllocationFailed)?
-                .start()
+                .map_err(|_| PmemError::AllocationFailed)?;
+            #[cfg(target_arch = "x86_64")]
+            let range = if range.end() >= host_phys_limit() {
+                _ = alloc.past_mmio64_memory.free(&range);
+                let range = alloc
+                    .mmio64_memory
+                    .allocate(size, Pmem::ALIGNMENT, AllocPolicy::FirstMatch)
+                    .map_err(|_| PmemError::AllocationFailed)?;
+                if range.end() >= host_phys_limit() {
+                    _ = alloc.mmio64_memory.free(&range);
+                    return Err(PmemError::AllocationFailed);
+                }
+                range
+            } else {
+                range
+            };
+            range.start()
         };
         Ok(Self {
             vm,
@@ -111,6 +134,15 @@ impl GuestPmemRegion {
     }
 }
 
+/// joos: one past the highest guest physical address KVM accepts on this host
+/// (1 << MAXPHYADDR, CPUID 0x80000008 EAX[7:0]).
+#[cfg(target_arch = "x86_64")]
+fn host_phys_limit() -> u64 {
+    // SAFETY: CPUID leaf 0x80000008 exists on every x86_64 CPU.
+    let leaf = unsafe { std::arch::x86_64::__cpuid(0x8000_0008) };
+    1u64 << (leaf.eax & 0xff)
+}
+
 impl Drop for GuestPmemRegion {
     fn drop(&mut self) {
         let range = RangeInclusive::new(
@@ -119,7 +151,12 @@ impl Drop for GuestPmemRegion {
         )
         .expect("Invalid config_space range");
         let mut alloc = self.vm.resource_allocator();
-        _ = alloc.past_mmio64_memory.free(&range);
+        // joos: GuestPmemRegion::new() may have used the MMIO64 range
+        if self.config_space.start >= crate::arch::FIRST_ADDR_PAST_64BITS_MMIO {
+            _ = alloc.past_mmio64_memory.free(&range);
+        } else {
+            _ = alloc.mmio64_memory.free(&range);
+        }
     }
 }
 
@@ -180,13 +217,27 @@ pub struct PmemMmap {
 impl PmemMmap {
     const ALIGNMENT: u64 = Pmem::ALIGNMENT;
 
-    pub fn new(path: &str, read_only: bool) -> Result<Self, PmemError> {
+    pub fn new(path: &str, read_only: bool, offset: u64, length: u64) -> Result<Self, PmemError> {
         let file = OpenOptions::new()
             .read(true)
             .write(!read_only)
             .open(path)
             .map_err(PmemError::BackingFile)?;
-        let file_len = file.metadata().unwrap().len();
+        // joos: map [offset, offset + length) of the file (PmemConfig offset/length)
+        let total_len = file.metadata().unwrap().len();
+        let page = 4096;
+        if offset % page != 0 || offset > total_len {
+            return Err(PmemError::BackingFile(std::io::Error::from(
+                std::io::ErrorKind::InvalidInput,
+            )));
+        }
+        let file_len = if length == 0 { total_len - offset } else { length };
+        if offset + file_len > total_len {
+            return Err(PmemError::BackingFile(std::io::Error::from(
+                std::io::ErrorKind::InvalidInput,
+            )));
+        }
+        let file_offset = offset as libc::off_t;
         if (file_len == 0) {
             return Err(PmemError::BackingFileZeroSize);
         }
@@ -207,7 +258,7 @@ impl PmemMmap {
                     prot,
                     libc::MAP_SHARED | libc::MAP_NORESERVE,
                     file.as_raw_fd(),
-                    0,
+                    file_offset,
                 );
                 if r == libc::MAP_FAILED {
                     return Err(PmemError::BackingFile(std::io::Error::last_os_error()));
@@ -241,7 +292,7 @@ impl PmemMmap {
                     prot,
                     libc::MAP_SHARED | libc::MAP_NORESERVE | libc::MAP_FIXED,
                     file.as_raw_fd(),
-                    0,
+                    file_offset,
                 );
                 if r == libc::MAP_FAILED {
                     return Err(PmemError::BackingFile(std::io::Error::last_os_error()));
@@ -313,7 +364,12 @@ impl Pmem {
         acked_features: u64,
         config_space: Option<ConfigSpace>,
     ) -> Result<Self, PmemError> {
-        let mmap = PmemMmap::new(&config.path_on_host, config.read_only)?;
+        let mmap = PmemMmap::new(
+            &config.path_on_host,
+            config.read_only,
+            config.offset,
+            config.length,
+        )?;
 
         let guest_region = match config_space {
             Some(cs) => GuestPmemRegion::from_state(vm.clone(), cs),
