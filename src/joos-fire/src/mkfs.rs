@@ -3,11 +3,13 @@
 // image config), before VmResources::from_json() opens it.
 //
 // Deliberately minimal: 4 KiB blocks, 32768 blocks per group, 256-byte inodes
-// (one per 16 KiB, mke2fs's default), sparse_super backups, and only the
-// filetype, extents, large_file and extra_isize features: no journal,
-// metadata_csum, flex_bg, 64bit, resize_inode or dir_index. Writes the
-// superblocks, group descriptors, bitmaps, the root directory and lost+found;
-// everything else (the inode tables included) is the sparse file's zeros.
+// (one per 16 KiB, mke2fs's default), sparse_super backups, a jbd2 journal
+// (from 8 MiB up), and only the has_journal, filetype, extents, large_file and
+// extra_isize features: no metadata_csum, journal checksums, flex_bg, 64bit,
+// resize_inode or dir_index. Writes the superblocks, group descriptors,
+// bitmaps, the root directory, lost+found and the journal's inode and
+// superblock; everything else (the inode tables and the rest of the journal
+// included) is the sparse file's zeros.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Error, ErrorKind};
@@ -24,20 +26,46 @@ const DESC_SIZE: u64 = 32;
 const ROOT_INO: u64 = 2;
 // lost+found, also the first non-reserved inode (s_first_ino)
 const LPF_INO: u64 = 11;
-// The root directory and lost+found, one block each, in group 0.
+// The root directory and lost+found, one block each, in group 0, followed by
+// the journal.
 const DATA_BLOCKS: u64 = 2;
+const JOURNAL_INO: u64 = 8;
 
+const COMPAT_HAS_JOURNAL: u64 = 0x4;
 const INCOMPAT_FILETYPE: u64 = 0x2;
 const INCOMPAT_EXTENTS: u64 = 0x40;
 const RO_COMPAT_SPARSE_SUPER: u64 = 0x1;
 const RO_COMPAT_LARGE_FILE: u64 = 0x2;
 const RO_COMPAT_EXTRA_ISIZE: u64 = 0x40;
 const EXTRA_ISIZE: u64 = 32;
+const EXTENTS_FL: u64 = 0x8_0000;
+
+/// mke2fs's default journal size for 4 KiB blocks (ext2fs_default_journal_size),
+/// capped at 64 MiB so it's one extent in group 0; none below 8 MiB (jbd2
+/// needs at least 1024 blocks).
+fn journal_blocks(blocks: u64) -> u64 {
+    if blocks < 2048 {
+        0
+    } else if blocks < 32768 {
+        1024
+    } else if blocks < 256 * 1024 {
+        4096
+    } else if blocks < 512 * 1024 {
+        8192
+    } else {
+        16384
+    }
+}
 
 /// Writes `val`'s low `len` bytes, little-endian, at `buf[off..]`.
 fn put(buf: &mut [u8], off: usize, len: usize, val: u64) {
     debug_assert!(len == 8 || val >> (len * 8) == 0, "{val} doesn't fit in {len} bytes");
     buf[off..off + len].copy_from_slice(&val.to_le_bytes()[..len]);
+}
+
+/// Writes `val` as a big-endian u32 at `buf[off..]` (jbd2's byte order).
+fn put_be32(buf: &mut [u8], off: usize, val: u64) {
+    buf[off..off + 4].copy_from_slice(&val.to_be_bytes()[4..]);
 }
 
 fn set_bits(bitmap: &mut [u8], from: u64, to: u64) {
@@ -65,6 +93,7 @@ struct Layout {
     groups: u64,
     inodes_per_group: u64,
     gdt_blocks: u64,
+    journal_blocks: u64,
 }
 
 impl Layout {
@@ -86,10 +115,13 @@ impl Layout {
                 groups,
                 inodes_per_group,
                 gdt_blocks: (groups * DESC_SIZE).div_ceil(BLOCK),
+                journal_blocks: journal_blocks(blocks),
             };
             let last = groups - 1;
-            let data = if last == 0 { DATA_BLOCKS } else { 0 };
+            let data = if last == 0 { layout.data_blocks() } else { 0 };
             if layout.group_blocks(last) > layout.overhead(last) + data {
+                // A full group 0 always has room for the data and journal.
+                debug_assert!(layout.overhead(0) + layout.data_blocks() <= layout.group_blocks(0));
                 return Ok(layout);
             }
             if last == 0 {
@@ -111,6 +143,11 @@ impl Layout {
 
     fn overhead(&self, group: u64) -> u64 {
         self.super_blocks(group) + 2 + self.inodes_per_group / INODES_PER_BLOCK
+    }
+
+    /// Group 0's blocks after its overhead: the two directories, then the journal.
+    fn data_blocks(&self) -> u64 {
+        DATA_BLOCKS + self.journal_blocks
     }
 }
 
@@ -143,7 +180,7 @@ fn write(file: &File, size: u64) -> Result<(), Error> {
     for group in 0..layout.groups {
         let block_bitmap = group * BLOCKS_PER_GROUP + layout.super_blocks(group);
         let first = group == 0;
-        let used_blocks = layout.overhead(group) + if first { DATA_BLOCKS } else { 0 };
+        let used_blocks = layout.overhead(group) + if first { layout.data_blocks() } else { 0 };
         let used_inodes = if first { LPF_INO } else { 0 };
         let group_free_blocks = layout.group_blocks(group) - used_blocks;
         let group_free_inodes = layout.inodes_per_group - used_inodes;
@@ -169,7 +206,7 @@ fn write(file: &File, size: u64) -> Result<(), Error> {
         file.write_all_at(&bitmap, (block_bitmap + 1) * BLOCK)?;
     }
 
-    // Superblock and descriptor table, in group 0 and the sparse_super copies
+    // The superblock (written with the descriptor table further down)
     let mut uuid = [0u8; 16];
     // SAFETY: uuid is a valid, writable 16-byte buffer for the whole call.
     if unsafe { libc::getrandom(uuid.as_mut_ptr().cast(), uuid.len(), 0) } != 16 {
@@ -196,6 +233,10 @@ fn write(file: &File, size: u64) -> Result<(), Error> {
     put(&mut sb, 0x4c, 4, 1); // revision: dynamic
     put(&mut sb, 0x54, 4, LPF_INO); // first non-reserved inode
     put(&mut sb, 0x58, 2, INODE_SIZE);
+    if layout.journal_blocks > 0 {
+        put(&mut sb, 0x5c, 4, COMPAT_HAS_JOURNAL);
+        put(&mut sb, 0xe0, 4, JOURNAL_INO);
+    }
     put(&mut sb, 0x60, 4, INCOMPAT_FILETYPE | INCOMPAT_EXTENTS);
     put(
         &mut sb,
@@ -208,18 +249,13 @@ fn write(file: &File, size: u64) -> Result<(), Error> {
     put(&mut sb, 0x15c, 2, EXTRA_ISIZE); // min extra inode size
     put(&mut sb, 0x15e, 2, EXTRA_ISIZE); // wanted extra inode size
     put(&mut sb, 0x160, 4, 1); // flags: signed directory hash (x86's char)
-    for group in (0..layout.groups).filter(|&g| has_super(g)) {
-        let start = group * BLOCKS_PER_GROUP * BLOCK;
-        put(&mut sb, 0x5a, 2, group); // this copy's group
-        // Group 0's superblock is at byte 1024; the copies start their group.
-        file.write_all_at(&sb, if group == 0 { 1024 } else { start })?;
-        file.write_all_at(&gdt, start + BLOCK)?;
-    }
 
-    // The root directory and lost+found: their inodes (both in the inode
-    // table's first block) and one directory block each
+    // The root directory, lost+found and the journal: their inodes (all in the
+    // inode table's first block), one directory block each, and the journal's
+    // superblock
     let root_block = layout.overhead(0);
     let lpf_block = root_block + 1;
+    let journal_block = lpf_block + 1;
     let mut inodes = vec![0u8; usize::try_from(BLOCK).unwrap()];
     for (ino, mode, links, block) in
         [(ROOT_INO, 0o40755, 3, root_block), (LPF_INO, 0o40700, 2, lpf_block)]
@@ -235,6 +271,58 @@ fn write(file: &File, size: u64) -> Result<(), Error> {
         put(inode, 0x28, 4, block); // i_block[0]: a block map, not extents
         put(inode, 0x80, 2, EXTRA_ISIZE);
         put(inode, 0x90, 4, now); // crtime
+    }
+    if layout.journal_blocks > 0 {
+        let inode = &mut inodes[usize::try_from((JOURNAL_INO - 1) * INODE_SIZE).unwrap()..];
+        let size = layout.journal_blocks * BLOCK;
+        put(inode, 0x00, 2, 0o100600);
+        put(inode, 0x04, 4, size & 0xffff_ffff);
+        put(inode, 0x6c, 4, size >> 32);
+        put(inode, 0x08, 4, now);
+        put(inode, 0x0c, 4, now);
+        put(inode, 0x10, 4, now);
+        put(inode, 0x1a, 2, 1); // links
+        put(inode, 0x1c, 4, layout.journal_blocks * (BLOCK / 512));
+        put(inode, 0x20, 4, EXTENTS_FL);
+        // i_block: an extent tree header with one extent, all in the inode
+        put(inode, 0x28, 2, 0xf30a); // magic
+        put(inode, 0x2a, 2, 1); // entries
+        put(inode, 0x2c, 2, 4); // max entries
+        put(inode, 0x2e, 2, 0); // depth: leaf
+        put(inode, 0x34, 4, 0); // first logical block
+        put(inode, 0x38, 2, layout.journal_blocks); // length (at most 32768)
+        put(inode, 0x3a, 2, 0); // physical start, high 16 bits
+        put(inode, 0x3c, 4, journal_block); // physical start, low 32 bits
+        put(inode, 0x80, 2, EXTRA_ISIZE);
+        put(inode, 0x90, 4, now);
+        // The superblock's backup of the journal inode's i_block and size
+        // (s_jnl_blocks; EXT3_JNL_BACKUP_BLOCKS), which e2fsck checks.
+        sb[0x10c..0x148].copy_from_slice(&inode[0x28..0x64]);
+        put(&mut sb, 0x148, 4, size >> 32);
+        put(&mut sb, 0x14c, 4, size & 0xffff_ffff);
+        put(&mut sb, 0xfd, 1, 1);
+
+        // jbd2 superblock, v2 (big-endian): an empty journal (s_start 0), so
+        // nothing past this block is ever read until the kernel writes it.
+        let mut jsb = [0u8; 1024];
+        put_be32(&mut jsb, 0x00, 0xc03b_3998); // magic
+        put_be32(&mut jsb, 0x04, 4); // block type: superblock v2
+        put_be32(&mut jsb, 0x0c, BLOCK);
+        put_be32(&mut jsb, 0x10, layout.journal_blocks); // s_maxlen
+        put_be32(&mut jsb, 0x14, 1); // s_first: the first log block
+        put_be32(&mut jsb, 0x18, 1); // s_sequence
+        jsb[0x30..0x40].copy_from_slice(&uuid); // the filesystem's, as mke2fs does
+        put_be32(&mut jsb, 0x40, 1); // s_nr_users
+        file.write_all_at(&jsb, journal_block * BLOCK)?;
+    }
+
+    // Superblock and descriptor table, in group 0 and the sparse_super copies
+    for group in (0..layout.groups).filter(|&g| has_super(g)) {
+        let start = group * BLOCKS_PER_GROUP * BLOCK;
+        put(&mut sb, 0x5a, 2, group); // this copy's group
+        // Group 0's superblock is at byte 1024; the copies start their group.
+        file.write_all_at(&sb, if group == 0 { 1024 } else { start })?;
+        file.write_all_at(&gdt, start + BLOCK)?;
     }
     file.write_all_at(&inodes, (layout.super_blocks(0) + 2) * BLOCK)?;
     let root = [(ROOT_INO, &b"."[..]), (ROOT_INO, b".."), (LPF_INO, b"lost+found")];
