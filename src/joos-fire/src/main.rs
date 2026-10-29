@@ -10,9 +10,11 @@
 // out entirely, matching how this project actually uses firecracker today
 // (single-shot boot, no interactive API calls).
 //
-// Expects fire.ext4 in the current directory, same as build/fire.
+// Expects fire.ext4 in the current directory, same as build/fire, or creates
+// it when the config has "create-disk-mib" (mkfs.rs).
 
 mod host_net;
+mod mkfs;
 
 use vmm::builder::build_microvm_for_boot;
 use vmm::logger::{LOGGER, LevelFilter, LoggerConfig};
@@ -337,6 +339,22 @@ fn main() {
     // used as it is.
     let config: VmmConfig = serde_json::from_str(config_json)
         .unwrap_or_else(|e| panic!("failed to parse embedded config JSON: {e}"));
+
+    // "create-disk-mib": a missing drive file is created as an empty ext4
+    // filesystem of that size (mkfs.rs), before from_json() opens it. An
+    // existing file is used as it is.
+    if let Some(mib) = config.create_disk_mib {
+        for drive in &config.drives {
+            let Some(path) = drive.path_on_host.as_deref().map(std::path::Path::new) else {
+                continue;
+            };
+            if !path.exists() {
+                mkfs::create(path, mib)
+                    .unwrap_or_else(|e| panic!("{}: create disk: {e}", path.display()));
+            }
+        }
+    }
+
     let tap = match (config.tap, config.network_interfaces.first()) {
         (Some(setup), Some(iface)) if setup.mode != TapMode::Existing => {
             let name = iface.host_dev_name.clone();

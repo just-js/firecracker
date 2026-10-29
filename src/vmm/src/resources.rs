@@ -111,6 +111,10 @@ pub struct VmmConfig {
     /// joos: create and configure the network interface's tap on the host (joos-fire).
     #[serde(default)]
     pub tap: Option<crate::vmm_config::net::TapSetup>,
+    /// joos: create a missing drive file as an empty ext4 filesystem of this many MiB
+    /// (joos-fire, mkfs.rs); without it a missing file fails as usual.
+    #[serde(default)]
+    pub create_disk_mib: Option<u64>,
 }
 
 /// A data structure that encapsulates the device configurations
@@ -608,6 +612,7 @@ impl From<&VmResources> for VmmConfig {
             terminal: resources.terminal,
             console: None,
             tap: resources.tap.clone(),
+            create_disk_mib: None,
         }
     }
 }

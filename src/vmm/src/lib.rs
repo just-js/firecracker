@@ -433,6 +433,7 @@ impl Vmm {
             terminal: false,
             console: None,
             tap: None,
+            create_disk_mib: None,
         }
     }
 
